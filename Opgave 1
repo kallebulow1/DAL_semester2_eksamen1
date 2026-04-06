@@ -1,0 +1,1677 @@
+## Eksamen
+
+# Pakker
+library(DBI)
+library(RMariaDB)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(stringr)
+
+#### Opgave 1 ####
+
+con <- dbConnect(
+  RMariaDB::MariaDB(),
+  host     = "www.talmedos.com",
+  port     = 3306,
+  user     = "dalremote",
+  password = "OttoRehagel123456789Long2026!",
+  dbname   = "superliga2"
+)
+
+
+
+## -----------------------------
+## 1) Hent skuddata (SQL)
+## -----------------------------
+shots_raw <- dbGetQuery(con, "
+WITH possession_start AS (
+  SELECT
+    POSSESSION_WYID,
+    PRIMARYTYPE AS possession_start_type,
+    ROW_NUMBER() OVER (
+      PARTITION BY POSSESSION_WYID
+      ORDER BY MATCH_WYID, MATCHPERIOD, MINUTE, SECOND, MATCHTIMESTAMP
+    ) AS rn
+  FROM wyscout_matchevents_common
+  WHERE SEASON_WYID = 189918
+    AND POSSESSION_WYID IS NOT NULL
+)
+
+SELECT
+  s.EVENT_WYID,
+  e.MATCH_WYID,
+  e.MINUTE,
+  e.SECOND,
+  e.LOCATIONX,
+  e.LOCATIONY,
+  e.TEAM_WYID,
+  e.OPPONENTTEAM_WYID,
+  e.PLAYER_WYID,
+  e.POSSESSION_WYID,
+  e.POSSESSIONDURATION,
+  s.SHOTISGOAL,
+  s.SHOTBODYPART,
+  ps.possession_start_type
+FROM wyscout_matchevents_shots s
+JOIN wyscout_matchevents_common e
+  ON s.EVENT_WYID = e.EVENT_WYID
+LEFT JOIN possession_start ps
+  ON e.POSSESSION_WYID = ps.POSSESSION_WYID
+ AND ps.rn = 1
+WHERE e.SEASON_WYID = 189918
+  AND LOWER(e.PRIMARYTYPE) = 'shot';
+") %>%
+  as_tibble()
+
+## -----------------------------
+## 2) Fjern dubletter + målvariabel
+## -----------------------------
+shots_clean <- shots_raw %>%
+  distinct(EVENT_WYID, .keep_all = TRUE)
+
+shots_clean <- shots_clean %>%
+  mutate(
+    is_goal = as.integer(
+      SHOTISGOAL == 1 | str_detect(tolower(SHOTBODYPART), "goal")
+    )
+  )
+
+table(shots_clean$SHOTBODYPART)
+
+## -----------------------------
+## 3) Body part (head / foot / other)
+## -----------------------------
+shots_clean <- shots_clean %>%
+  mutate(
+    bodypart = case_when(
+      str_detect(tolower(SHOTBODYPART), "head") ~ "head",
+      str_detect(tolower(SHOTBODYPART), "left") ~ "foot",
+      str_detect(tolower(SHOTBODYPART), "right") ~ "foot",
+      str_detect(tolower(SHOTBODYPART), "foot") ~ "foot",
+      TRUE ~ NA_character_   # <-- vigtigt: sæt støj til NA
+    )
+  )
+
+## -----------------------------
+## 4) Set piece kategori
+## -----------------------------
+shots_clean <- shots_clean %>%
+  mutate(
+    set_piece_category = case_when(
+      tolower(possession_start_type) == "corner" ~ "corner",
+      tolower(possession_start_type) %in% c("free_kick", "penalty") ~ "free_kick_or_penalty",
+      tolower(possession_start_type) %in% c("throw_in", "goal_kick") ~ "restart_other",
+      TRUE ~ "open_play"
+    )
+  )
+
+## -----------------------------
+## 5) Feature engineering (distance + angle)
+## -----------------------------
+shots_clean <- shots_clean %>%
+  mutate(
+    x_meter = LOCATIONX * 105 / 100,
+    y_meter = LOCATIONY * 68 / 100
+  )
+
+shots_clean <- shots_clean %>%
+  mutate(
+    distance_meter = sqrt((105 - x_meter)^2 + (34 - y_meter)^2)
+  )
+
+shots_clean <- shots_clean %>%
+  mutate(
+    goal_left_y  = 34 - 7.32 / 2,
+    goal_right_y = 34 + 7.32 / 2,
+    
+    d_left  = sqrt((105 - x_meter)^2 + (goal_left_y - y_meter)^2),
+    d_right = sqrt((105 - x_meter)^2 + (goal_right_y - y_meter)^2),
+    
+    cos_angle = (d_left^2 + d_right^2 - 7.32^2) / (2 * d_left * d_right),
+    cos_angle = pmin(pmax(cos_angle, -1), 1),
+    
+    angle_deg = acos(cos_angle) * 180 / pi,
+    
+    possession_duration = POSSESSIONDURATION
+  )
+
+## -----------------------------
+## 6) Data cleaning + outliers
+## -----------------------------
+xg_data <- shots_clean %>%
+  filter(
+    !is.na(is_goal), # fjern rækker uden mål-label
+    !is.na(distance_meter), # fjern rækker uden mål-label
+    !is.na(angle_deg), 
+    distance_meter < 60,
+    angle_deg < 120
+  )
+
+## -----------------------------
+## 7) Udvælg relevante variable
+## -----------------------------
+xg_data <- xg_data %>%
+  select(
+    EVENT_WYID,
+    MATCH_WYID,
+    TEAM_WYID,
+    OPPONENTTEAM_WYID,
+    PLAYER_WYID,
+    MINUTE,
+    SECOND,
+    is_goal,
+    bodypart,
+    distance_meter,
+    angle_deg,
+    possession_duration,
+    set_piece_category
+  )
+
+## -----------------------------
+## 8) Train/test split
+## -----------------------------
+set.seed(123)
+
+
+
+train_index <- sample(
+  seq_len(nrow(xg_data)),
+  size = 0.8 * nrow(xg_data)
+)
+
+train_data <- xg_data[train_index, ]
+test_data  <- xg_data[-train_index, ]
+
+## -----------------------------
+## 9) Tjek split
+## -----------------------------
+nrow(train_data)
+nrow(test_data)
+
+mean(train_data$is_goal)
+mean(test_data$is_goal)
+
+
+# Kort tekst til opgaven:
+cat("
+Opgave 1.1 - kort forklaring:
+Data er opdelt i et træningssæt og et testsæt med en 80/20-fordeling på skudniveau.
+Træningssættet bruges til at estimere modellen, mens testsættet bruges til at evaluere,
+hvordan modellen klarer sig på observationer, den ikke har set før.
+Vi har valgt en simpel random split, da observationerne er skud, og formålet er at opbygge
+en første xG-model for sæsonen 2024/2025. Fordelingen mellem træning og test gør, at vi både
+har nok data til at træne modellen og samtidig bevarer et separat datasæt til evaluering.
+")
+
+
+
+#### 1.2 ####
+
+# Opgave 1.2:
+# Beskriv de forklarende variable, lav feature engineering,
+# grafiske illustrationer og beskrivende statistik.
+
+# -----------------------------
+# 1) Beskrivende statistik
+# -----------------------------
+summary_stats_numeric <- xg_data %>%
+  summarise(
+    n_shots = n(),
+    goal_rate = mean(is_goal, na.rm = TRUE),
+    mean_distance = mean(distance_meter, na.rm = TRUE),
+    median_distance = median(distance_meter, na.rm = TRUE),
+    sd_distance = sd(distance_meter, na.rm = TRUE),
+    mean_angle = mean(angle_deg, na.rm = TRUE),
+    median_angle = median(angle_deg, na.rm = TRUE),
+    sd_angle = sd(angle_deg, na.rm = TRUE),
+    mean_possession_duration = mean(possession_duration, na.rm = TRUE),
+    median_possession_duration = median(possession_duration, na.rm = TRUE),
+    sd_possession_duration = sd(possession_duration, na.rm = TRUE)
+  )
+
+summary_stats_numeric
+
+bodypart_stats <- xg_data %>%
+  count(bodypart_detail) %>%           # tæller hvor mange skud der er i hver detaljeret kropsdel
+  mutate(prop = n / sum(n))            # laver andel (procent)
+
+setpiece_stats <- xg_data %>%
+  count(set_piece_category) %>%        # tæller skud i hver type angreb
+  mutate(prop = n / sum(n))            # laver andel (procent)
+
+bodypart_stats
+setpiece_stats
+
+# -----------------------------
+# 2) Grafiske illustrationer
+# -----------------------------
+
+# Distance til mål
+ggplot(xg_data, aes(x = distance_meter)) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Fordeling af distance til mål",
+    x = "Distance til mål (meter)",
+    y = "Antal skud"
+  ) +
+  theme_minimal()
+
+# Vinkel
+ggplot(xg_data, aes(x = angle_deg)) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Fordeling af skudvinkel",
+    x = "Vinkel (grader)",
+    y = "Antal skud"
+  ) +
+  theme_minimal()
+
+# Possession duration
+ggplot(xg_data, aes(x = possession_duration)) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Fordeling af possession duration",
+    x = "Possession duration (sekunder)",
+    y = "Antal skud"
+  ) +
+  theme_minimal()
+
+# Body part
+ggplot(xg_data, aes(x = bodypart_detail)) +
+  geom_bar() +
+  labs(
+    title = "Skud fordelt på kropsdel",
+    x = "Body part",
+    y = "Antal skud"
+  ) +
+  theme_minimal()
+
+# Set piece kategori
+ggplot(xg_data, aes(x = set_piece_category)) +
+  geom_bar() +
+  labs(
+    title = "Skud fordelt på open play og dødboldstyper",
+    x = "Type af angreb",
+    y = "Antal skud"
+  ) +
+  theme_minimal()
+
+# Distance vs mål
+ggplot(xg_data, aes(x = factor(is_goal), y = distance_meter)) +
+  geom_boxplot() +
+  labs(
+    title = "Distance til mål fordelt på mål og ikke-mål",
+    x = "Er skuddet mål? (0 = nej, 1 = ja)",
+    y = "Distance til mål (meter)"
+  ) +
+  theme_minimal()
+
+# Vinkel vs mål
+ggplot(xg_data, aes(x = factor(is_goal), y = angle_deg)) +
+  geom_boxplot() +
+  labs(
+    title = "Vinkel fordelt på mål og ikke-mål",
+    x = "Er skuddet mål? (0 = nej, 1 = ja)",
+    y = "Vinkel (grader)"
+  ) +
+  theme_minimal()
+
+# Possession duration vs mål
+ggplot(xg_data, aes(x = factor(is_goal), y = possession_duration)) +
+  geom_boxplot() +
+  labs(
+    title = "Possession duration fordelt på mål og ikke-mål",
+    x = "Er skuddet mål? (0 = nej, 1 = ja)",
+    y = "Possession duration (sekunder)"
+  ) +
+  theme_minimal()
+
+# -----------------------------
+# 3) Kort tekst til opgaven
+# -----------------------------
+cat("
+Opgave 1.2 - kort forklaring:
+Vi har valgt fem forklarende variable til xG-modellen: distance til mål, vinkel, body part,
+possession duration og type af angrebssituation. Distance og vinkel er feature-engineeret ud
+fra skuddets position på banen. LocationX og LocationY omregnes først til meter, hvorefter
+distance til mål beregnes som den euklidiske afstand fra skudpositionen til midten af målet.
+Vinklen beregnes som vinklen mellem de to målstolper set fra skuddets position.
+
+Body part er renset, så kun valide afslutningstyper beholdes. I den detaljerede beskrivelse
+arbejdes der med left_foot, right_foot og head, mens der i selve modellen bruges en simplere
+variabel, hvor left_foot og right_foot samles til foot. Observationer med irrelevante eller
+uklare værdier er fjernet fra datasættet. Possession duration hentes direkte fra data og bruges
+som et mål for, hvor længe holdet har haft bolden inden afslutningen.
+")
+
+
+#### 1.3 ####
+
+# Opgave 1.3:
+# Hvilke variable forventes at have effekt på,
+# om et skud bliver til mål?
+
+# -----------------------------
+# 1) Målrate pr. kategori
+# -----------------------------
+goal_rate_bodypart <- xg_data %>%
+  group_by(bodypart) %>%                   # opdeler data i head / foot / other
+  summarise(
+    n_shots = n(),                         # antal skud i hver kategori
+    goal_rate = mean(is_goal, na.rm = TRUE) # andel mål (0/1 → gennemsnit = sandsynlighed)
+  ) %>%
+  arrange(desc(goal_rate))                 # sorterer fra højeste til laveste
+
+goal_rate_bodypart
+
+goal_rate_setpiece <- xg_data %>%
+  group_by(set_piece_category) %>%         # opdeler i open play / corner / osv.
+  summarise(
+    n_shots = n(),
+    goal_rate = mean(is_goal, na.rm = TRUE)
+  ) %>%
+  arrange(desc(goal_rate))
+
+goal_rate_setpiece
+
+# -----------------------------
+# 2) Målrate efter simple intervaller
+# -----------------------------
+goal_rate_distance <- xg_data %>%
+  mutate(
+    # opdeler distance i intervaller (0-10, 10-20 osv.)
+    distance_group = cut(
+      distance_meter,
+      breaks = c(0, 10, 20, 30, 40, Inf),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(distance_group) %>%             # analyserer hver distance-gruppe
+  summarise(
+    n_shots = n(),
+    goal_rate = mean(is_goal, na.rm = TRUE)
+  )
+
+goal_rate_distance
+
+goal_rate_angle <- xg_data %>%
+  mutate(
+    # opdeler vinkler i intervaller
+    angle_group = cut(
+      angle_deg,
+      breaks = c(0, 10, 20, 30, 40, 50, 60, Inf),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(angle_group) %>%
+  summarise(
+    n_shots = n(),
+    goal_rate = mean(is_goal, na.rm = TRUE)
+  )
+
+goal_rate_angle
+
+goal_rate_possession <- xg_data %>%
+  mutate(
+    # opdeler possession i intervaller (kort → lang)
+    possession_group = cut(
+      possession_duration,
+      breaks = c(0, 5, 10, 20, 40, Inf),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(possession_group) %>%
+  summarise(
+    n_shots = n(),
+    goal_rate = mean(is_goal, na.rm = TRUE)
+  )
+
+goal_rate_possession
+
+# -----------------------------
+# 3) Kort tekst til opgaven
+# -----------------------------
+cat("
+Opgave 1.3 - kort forklaring:
+Vi forventer især, at distance til mål og vinkel har stor betydning for,
+om et skud bliver til mål. Jo tættere et skud tages på målet, desto større
+er sandsynligheden typisk for scoring. Tilsvarende forventes en større vinkel
+mod målet at øge sandsynligheden for mål, fordi spilleren har mere af målet at sigte efter.
+
+Vi forventer også, at body part har betydning. Skud med hovedet har ofte en anden kvalitet
+end skud med fødderne, blandt andet fordi hovedstød ofte afsluttes under mere pres og med
+mindre kontrol. Derudover forventer vi, at type af angrebssituation påvirker sandsynligheden
+for mål. Eksempelvis kan hjørnespark og frispark skabe andre typer afslutninger end open play.
+
+Endelig forventer vi, at possession duration kan have en effekt. Korte possessions kan være
+forbundet med omstillinger og hurtige angreb, mens længere possessions kan hænge sammen med
+mere etableret angrebsspil. Derfor kan possession duration være med til at opfange forskelle
+i, hvordan chancerne bliver skabt.
+")
+
+#### 1.4 ####
+
+library(caret)
+library(rpart)
+library(randomForest)
+library(xgboost)
+library(pROC)
+
+## ---------------------------
+## 1) Klargør target til caret
+## caret vil ikke have factor-levels som 0 og 1
+## derfor bruger vi "No" og "Goal"
+## ---------------------------
+train_data$is_goal <- factor(
+  train_data$is_goal,
+  levels = c(0, 1),
+  labels = c("No", "Goal")
+)
+
+test_data$is_goal <- factor(
+  test_data$is_goal,
+  levels = c(0, 1),
+  labels = c("No", "Goal")
+)
+
+## ---------------------------
+## 2) Cross validation setup
+## ---------------------------
+control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE
+)
+
+## ---------------------------
+## 3) Beslutningstræ
+## ---------------------------
+tree_model <- train(
+  is_goal ~ distance_meter + angle_deg + bodypart +
+    possession_duration + set_piece_category,
+  data = train_data,
+  method = "rpart",
+  trControl = control
+)
+
+## ---------------------------
+## 4) Random Forest
+## ---------------------------
+rf_model <- train(
+  is_goal ~ distance_meter + angle_deg + bodypart +
+    possession_duration + set_piece_category,
+  data = train_data,
+  method = "rf",
+  trControl = control,
+  ntree = 300
+)
+
+## ---------------------------
+## 5) XGBoost
+## XGBoost skal have numerisk target (0/1)
+## og kun de rigtige forklarende variable
+## ---------------------------
+
+# model.matrix laver kategoriske variable om til dummy-variable
+train_x <- model.matrix(
+  is_goal ~ distance_meter + angle_deg + bodypart +
+    possession_duration + set_piece_category - 1,
+  data = train_data
+)
+
+test_x <- model.matrix(
+  is_goal ~ distance_meter + angle_deg + bodypart +
+    possession_duration + set_piece_category - 1,
+  data = test_data
+)
+
+# numerisk target til xgboost
+train_y <- ifelse(train_data$is_goal == "Goal", 1, 0)
+test_y  <- ifelse(test_data$is_goal == "Goal", 1, 0)
+
+# xgboost model
+xgb_model <- xgboost(
+  x = train_x,
+  y = train_y,
+  nrounds = 50,
+  max_depth = 3,
+  learning_rate = 0.1,
+  eval_metric = "logloss",
+  verbosity = 0
+)
+
+## ---------------------------
+## 6) Klassifikation og confusion matrix
+## ---------------------------
+
+# Decision tree
+pred_tree <- predict(tree_model, test_data)
+confusionMatrix(pred_tree, test_data$is_goal)
+
+# Random Forest
+pred_rf <- predict(rf_model, test_data)
+confusionMatrix(pred_rf, test_data$is_goal)
+
+# XGBoost sandsynligheder
+pred_xgb <- predict(xgb_model, test_x)
+
+# standard threshold 0.5
+pred_xgb_class <- ifelse(pred_xgb > 0.5, "Goal", "No")
+pred_xgb_class <- factor(pred_xgb_class, levels = c("No", "Goal"))
+
+confusionMatrix(pred_xgb_class, test_data$is_goal)
+
+## ---------------------------
+## 7) Threshold-eksperimenter
+## Tester om XGBoost bliver bedre til at fange mål
+## ---------------------------
+pred_xgb_class_02 <- factor(
+  ifelse(pred_xgb > 0.2, "Goal", "No"),
+  levels = c("No", "Goal")
+)
+
+pred_xgb_class_03 <- factor(
+  ifelse(pred_xgb > 0.3, "Goal", "No"),
+  levels = c("No", "Goal")
+)
+
+pred_xgb_class_04 <- factor(
+  ifelse(pred_xgb > 0.4, "Goal", "No"),
+  levels = c("No", "Goal")
+)
+
+confusionMatrix(pred_xgb_class_02, test_data$is_goal)
+confusionMatrix(pred_xgb_class_03, test_data$is_goal)
+confusionMatrix(pred_xgb_class_04, test_data$is_goal)
+
+## ---------------------------
+## 8) ROC og AUC
+## Her bruger vi sandsynligheder i stedet for klasser
+## ---------------------------
+
+# XGBoost
+roc_xgb <- roc(test_y, pred_xgb)
+auc_xgb <- auc(roc_xgb)
+
+# Decision Tree
+pred_tree_prob <- predict(tree_model, test_data, type = "prob")[, "Goal"]
+roc_tree <- roc(test_y, pred_tree_prob)
+auc_tree <- auc(roc_tree)
+
+# Random Forest
+pred_rf_prob <- predict(rf_model, test_data, type = "prob")[, "Goal"]
+roc_rf <- roc(test_y, pred_rf_prob)
+auc_rf <- auc(roc_rf)
+
+# samlet ROC-plot
+plot(roc_tree, col = "blue")
+lines(roc_rf, col = "green")
+lines(roc_xgb, col = "red")
+
+legend(
+  "bottomright",
+  legend = c(
+    paste("Tree AUC =", round(auc_tree, 3)),
+    paste("RF AUC =", round(auc_rf, 3)),
+    paste("XGB AUC =", round(auc_xgb, 3))
+  ),
+  col = c("blue", "green", "red"),
+  lwd = 2
+)
+
+#### 1.5 ####
+
+
+library(shiny)
+library(bslib)
+library(dplyr)
+library(ggplot2)
+library(DT)
+library(caret)
+library(pROC)
+library(xgboost)
+library(scales)
+library(tidyr)
+
+## -----------------------------
+## Tjek at nødvendige objekter findes
+## -----------------------------
+needed_objects <- c(
+  "tree_model", "rf_model", "xgb_model",
+  "train_data", "test_data", "train_x", "test_x"
+)
+
+missing_objects <- needed_objects[!sapply(needed_objects, exists)]
+
+if (length(missing_objects) > 0) {
+  stop(
+    paste(
+      "Følgende objekter mangler i dit environment:",
+      paste(missing_objects, collapse = ", ")
+    )
+  )
+}
+
+## -----------------------------
+## Predictions
+## -----------------------------
+test_truth <- factor(test_data$is_goal, levels = c("No", "Goal"))
+
+# Decision tree
+pred_tree_class <- predict(tree_model, test_data)
+pred_tree_prob  <- predict(tree_model, test_data, type = "prob")[, "Goal"]
+
+# Random forest
+pred_rf_class <- predict(rf_model, test_data)
+pred_rf_prob  <- predict(rf_model, test_data, type = "prob")[, "Goal"]
+
+# XGBoost
+pred_xgb_prob <- predict(xgb_model, test_x)
+
+# valgt threshold
+best_threshold <- 0.2
+pred_xgb_class <- ifelse(pred_xgb_prob > best_threshold, "Goal", "No")
+pred_xgb_class <- factor(pred_xgb_class, levels = c("No", "Goal"))
+
+## -----------------------------
+## Hjælpefunktioner
+## -----------------------------
+get_metrics <- function(pred_class, truth, positive_class = "Goal") {
+  cm <- confusionMatrix(
+    factor(pred_class, levels = c("No", "Goal")),
+    factor(truth, levels = c("No", "Goal")),
+    positive = positive_class
+  )
+  
+  tibble(
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Kappa = unname(cm$overall["Kappa"]),
+    Sensitivity = unname(cm$byClass["Sensitivity"]),
+    Specificity = unname(cm$byClass["Specificity"]),
+    Balanced_Accuracy = unname(cm$byClass["Balanced Accuracy"])
+  )
+}
+
+get_metrics_from_prob <- function(prob, truth, threshold = 0.5) {
+  pred_class <- ifelse(prob > threshold, "Goal", "No")
+  get_metrics(pred_class, truth, positive_class = "Goal")
+}
+
+roc_to_df <- function(roc_obj) {
+  tibble(
+    specificity = roc_obj$specificities,
+    sensitivity = roc_obj$sensitivities
+  )
+}
+
+confusion_df <- function(pred_class, truth) {
+  tab <- table(
+    Prediction = factor(pred_class, levels = c("No", "Goal")),
+    Actual = factor(truth, levels = c("No", "Goal"))
+  )
+  
+  as.data.frame(tab)
+}
+
+## -----------------------------
+## ROC og AUC
+## -----------------------------
+test_y_num <- ifelse(test_data$is_goal == "Goal", 1, 0)
+
+roc_tree <- roc(test_y_num, pred_tree_prob)
+roc_rf   <- roc(test_y_num, pred_rf_prob)
+roc_xgb  <- roc(test_y_num, pred_xgb_prob)
+
+auc_tree <- as.numeric(auc(roc_tree))
+auc_rf   <- as.numeric(auc(roc_rf))
+auc_xgb  <- as.numeric(auc(roc_xgb))
+
+roc_df <- bind_rows(
+  roc_to_df(roc_tree) %>% mutate(Model = "Decision Tree"),
+  roc_to_df(roc_rf)   %>% mutate(Model = "Random Forest"),
+  roc_to_df(roc_xgb)  %>% mutate(Model = "XGBoost")
+)
+
+## -----------------------------
+## Performance tabel
+## -----------------------------
+perf_tree <- get_metrics(pred_tree_class, test_truth) %>%
+  mutate(Model = "Decision Tree", Threshold = NA_real_, AUC = auc_tree)
+
+perf_rf <- get_metrics(pred_rf_class, test_truth) %>%
+  mutate(Model = "Random Forest", Threshold = NA_real_, AUC = auc_rf)
+
+perf_xgb <- get_metrics_from_prob(pred_xgb_prob, test_truth, threshold = best_threshold) %>%
+  mutate(Model = "XGBoost", Threshold = best_threshold, AUC = auc_xgb)
+
+performance_table <- bind_rows(perf_tree, perf_rf, perf_xgb) %>%
+  select(Model, AUC, Accuracy, Balanced_Accuracy, Sensitivity, Specificity, Threshold) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+## -----------------------------
+## Threshold tabel for XGBoost
+## -----------------------------
+threshold_values <- c(0.2, 0.3, 0.4, 0.5)
+
+threshold_table <- bind_rows(lapply(threshold_values, function(t) {
+  get_metrics_from_prob(pred_xgb_prob, test_truth, threshold = t) %>%
+    mutate(Threshold = t, AUC = auc_xgb)
+})) %>%
+  select(Threshold, AUC, Accuracy, Balanced_Accuracy, Sensitivity, Specificity) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+## -----------------------------
+## Feature importance
+## -----------------------------
+importance_table <- xgb.importance(
+  model = xgb_model,
+  feature_names = colnames(train_x)
+) %>%
+  as_tibble() %>%
+  mutate(
+    Gain = round(Gain, 3),
+    Cover = round(Cover, 3),
+    Frequency = round(Frequency, 3)
+  )
+
+top_importance <- importance_table %>%
+  slice_max(order_by = Gain, n = 10)
+
+## -----------------------------
+## Data til visualisering
+## -----------------------------
+plot_data <- test_data %>%
+  mutate(
+    is_goal = factor(is_goal, levels = c("No", "Goal"), labels = c("Ikke mål", "Mål")),
+    pred_xgb_prob = pred_xgb_prob
+  )
+
+## -----------------------------
+## UI
+## -----------------------------
+ui <- navbarPage(
+  title = "XG model præsentation",
+  theme = bs_theme(
+    version = 5,
+    bootswatch = "flatly",
+    primary = "#1f4e79",
+    secondary = "#6c757d",
+    base_font = font_google("Inter")
+  ),
+  
+  tabPanel(
+    "Resumé",
+    fluidPage(
+      br(),
+      fluidRow(
+        column(
+          4,
+          card(
+            card_header("Bedste model"),
+            card_body(
+              h2("XGBoost"),
+              p("Valgt på baggrund af højeste AUC.")
+            )
+          )
+        ),
+        column(
+          4,
+          card(
+            card_header("AUC"),
+            card_body(
+              h2(round(auc_xgb, 3)),
+              p("Modelens evne til at skelne mellem mål og ikke-mål.")
+            )
+          )
+        ),
+        column(
+          4,
+          card(
+            card_header("Valgt threshold"),
+            card_body(
+              h2(best_threshold),
+              p("Valgt for at forbedre modellens evne til at identificere mål.")
+            )
+          )
+        )
+      ),
+      br(),
+      card(
+        card_header("Kort resumé"),
+        card_body(
+          p("Formålet med modellen er at estimere sandsynligheden for, at et skud bliver til mål."),
+          p("Tre modeller blev testet: Decision Tree, Random Forest og XGBoost."),
+          p("XGBoost blev valgt som den bedste model, da den opnåede den højeste AUC og dermed den bedste evne til at rangere farlige og ufarlige skud."),
+          p("Da mål er en sjælden hændelse i fodbold, er accuracy alene ikke nok. Derfor præsenteres modellen også med ROC/AUC og threshold-analyse.")
+        )
+      ),
+      br(),
+      card(
+        card_header("Tabel 1: Sammenligning af modeller"),
+        card_body(DTOutput("perf_table"))
+      )
+    )
+  ),
+  
+  tabPanel(
+    "ROC og feature importance",
+    fluidPage(
+      br(),
+      fluidRow(
+        column(
+          7,
+          card(
+            card_header("Graf 1: ROC-kurve for alle modeller"),
+            card_body(plotOutput("roc_plot", height = "500px"))
+          )
+        ),
+        column(
+          5,
+          card(
+            card_header("Tabel 2: Threshold-analyse for XGBoost"),
+            card_body(DTOutput("threshold_table"))
+          )
+        )
+      ),
+      br(),
+      fluidRow(
+        column(
+          7,
+          card(
+            card_header("Graf 2: Feature importance i XGBoost"),
+            card_body(plotOutput("importance_plot", height = "500px"))
+          )
+        ),
+        column(
+          5,
+          card(
+            card_header("Tabel 3: Top 10 vigtigste features"),
+            card_body(DTOutput("importance_table"))
+          )
+        )
+      )
+    )
+  ),
+  
+  tabPanel(
+    "Interaktiv threshold",
+    fluidPage(
+      br(),
+      sidebarLayout(
+        sidebarPanel(
+          sliderInput(
+            "threshold",
+            "Vælg threshold for XGBoost",
+            min = 0.05,
+            max = 0.50,
+            value = 0.20,
+            step = 0.05
+          ),
+          p("Lavere threshold gør modellen mere villig til at forudsige mål."),
+          p("Det øger typisk antallet af korrekt fundne mål, men også antallet af falske positive.")
+        ),
+        mainPanel(
+          fluidRow(
+            column(
+              6,
+              card(
+                card_header("Dynamiske modelmål"),
+                card_body(DTOutput("dynamic_metrics"))
+              )
+            ),
+            column(
+              6,
+              card(
+                card_header("Confusion matrix"),
+                card_body(plotOutput("cm_plot", height = "350px"))
+              )
+            )
+          )
+        )
+      )
+    )
+  ),
+  
+  tabPanel(
+    "Data explorer",
+    fluidPage(
+      br(),
+      sidebarLayout(
+        sidebarPanel(
+          selectInput(
+            "bodypart_filter",
+            "Body part",
+            choices = c("Alle", sort(unique(as.character(plot_data$bodypart)))),
+            selected = "Alle"
+          ),
+          selectInput(
+            "setpiece_filter",
+            "Set piece kategori",
+            choices = c("Alle", sort(unique(as.character(plot_data$set_piece_category)))),
+            selected = "Alle"
+          )
+        ),
+        mainPanel(
+          fluidRow(
+            column(
+              8,
+              card(
+                card_header("Graf 3: Skud fordelt på distance og vinkel"),
+                card_body(plotOutput("shot_plot", height = "500px"))
+              )
+            ),
+            column(
+              4,
+              card(
+                card_header("Tabel 4: Beskrivende statistik for valgt udsnit"),
+                card_body(DTOutput("data_summary"))
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+## -----------------------------
+## Server
+## -----------------------------
+server <- function(input, output, session) {
+  
+  output$perf_table <- renderDT({
+    datatable(
+      performance_table,
+      rownames = FALSE,
+      options = list(dom = "t", pageLength = 5)
+    )
+  })
+  
+  output$threshold_table <- renderDT({
+    datatable(
+      threshold_table,
+      rownames = FALSE,
+      options = list(dom = "t", pageLength = 5)
+    )
+  })
+  
+  output$importance_table <- renderDT({
+    datatable(
+      top_importance,
+      rownames = FALSE,
+      options = list(pageLength = 10)
+    )
+  })
+  
+  output$roc_plot <- renderPlot({
+    ggplot(roc_df, aes(x = specificity, y = sensitivity, color = Model)) +
+      geom_line(linewidth = 1.2) +
+      geom_abline(slope = -1, intercept = 1, linetype = "dashed", color = "grey50") +
+      scale_x_reverse(labels = number_format(accuracy = 0.1)) +
+      scale_y_continuous(labels = number_format(accuracy = 0.1)) +
+      labs(
+        title = "ROC-kurve for de tre modeller",
+        x = "Specificity",
+        y = "Sensitivity",
+        color = "Model"
+      ) +
+      annotate("text", x = 0.35, y = 0.25,
+               label = paste0("XGBoost AUC = ", round(auc_xgb, 3)),
+               color = "#d62728", hjust = 0, size = 4.5) +
+      annotate("text", x = 0.35, y = 0.18,
+               label = paste0("RF AUC = ", round(auc_rf, 3)),
+               color = "#2ca02c", hjust = 0, size = 4.5) +
+      annotate("text", x = 0.35, y = 0.11,
+               label = paste0("Tree AUC = ", round(auc_tree, 3)),
+               color = "#1f77b4", hjust = 0, size = 4.5) +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$importance_plot <- renderPlot({
+    top_importance %>%
+      mutate(Feature = reorder(Feature, Gain)) %>%
+      ggplot(aes(x = Feature, y = Gain)) +
+      geom_col(fill = "#1f4e79") +
+      coord_flip() +
+      labs(
+        title = "Top 10 vigtigste features i XGBoost",
+        x = NULL,
+        y = "Gain"
+      ) +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$dynamic_metrics <- renderDT({
+    dynamic_metrics <- get_metrics_from_prob(
+      pred_xgb_prob,
+      test_truth,
+      threshold = input$threshold
+    ) %>%
+      mutate(
+        Threshold = input$threshold,
+        AUC = auc_xgb
+      ) %>%
+      select(Threshold, AUC, Accuracy, Balanced_Accuracy, Sensitivity, Specificity) %>%
+      mutate(across(where(is.numeric), ~ round(.x, 3)))
+    
+    datatable(
+      dynamic_metrics,
+      rownames = FALSE,
+      options = list(dom = "t")
+    )
+  })
+  
+  output$cm_plot <- renderPlot({
+    pred_class <- ifelse(pred_xgb_prob > input$threshold, "Goal", "No")
+    
+    cm_df <- confusion_df(pred_class, test_truth)
+    
+    ggplot(cm_df, aes(x = Actual, y = Prediction, fill = Freq)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = Freq), size = 8, fontface = "bold") +
+      scale_fill_gradient(low = "#dbe9f6", high = "#1f4e79") +
+      labs(
+        title = paste("Confusion matrix ved threshold =", input$threshold),
+        x = "Faktisk klasse",
+        y = "Forudsagt klasse"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = "none")
+  })
+  
+  filtered_data <- reactive({
+    df <- plot_data
+    
+    if (input$bodypart_filter != "Alle") {
+      df <- df %>% filter(bodypart == input$bodypart_filter)
+    }
+    
+    if (input$setpiece_filter != "Alle") {
+      df <- df %>% filter(set_piece_category == input$setpiece_filter)
+    }
+    
+    df
+  })
+  
+  output$shot_plot <- renderPlot({
+    ggplot(filtered_data(), aes(x = distance_meter, y = angle_deg)) +
+      geom_point(aes(color = pred_xgb_prob, shape = is_goal), alpha = 0.7, size = 2.5) +
+      scale_color_gradient(low = "#cfe2f3", high = "#0b5394") +
+      labs(
+        title = "Skud fordelt på distance og vinkel",
+        subtitle = "Farven viser modelens sandsynlighed for mål",
+        x = "Distance til mål (meter)",
+        y = "Vinkel (grader)",
+        color = "Predikteret\nxG",
+        shape = "Faktisk udfald"
+      ) +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$data_summary <- renderDT({
+    df <- filtered_data()
+    
+    summary_tbl <- tibble(
+      Antal_skud = nrow(df),
+      Maalrate = round(mean(df$is_goal == "Mål"), 3),
+      Gns_distance = round(mean(df$distance_meter), 2),
+      Gns_vinkel = round(mean(df$angle_deg), 2),
+      Gns_predikteret_xG = round(mean(df$pred_xgb_prob), 3)
+    )
+    
+    datatable(
+      summary_tbl,
+      rownames = FALSE,
+      options = list(dom = "t")
+    )
+  })
+}
+
+shinyApp(ui, server)
+
+
+#### 1.6 ####
+
+
+#### DEL 1 – HENT BRØNDBY-DATA ####
+
+library(DBI)
+library(dplyr)
+library(stringr)
+library(tibble)
+
+# Henter alle skud i indeværende sæson (191611)
+# både Brøndbys egne skud og skud imod Brøndby
+brondby_raw <- dbGetQuery(con, "
+WITH possession_start AS (
+  SELECT
+    POSSESSION_WYID,
+    PRIMARYTYPE AS possession_start_type,
+    ROW_NUMBER() OVER (
+      PARTITION BY POSSESSION_WYID
+      ORDER BY MATCH_WYID, MATCHPERIOD, MINUTE, SECOND, MATCHTIMESTAMP
+    ) AS rn
+  FROM wyscout_matchevents_common
+  WHERE SEASON_WYID = 191611
+    AND POSSESSION_WYID IS NOT NULL
+)
+
+SELECT
+  s.EVENT_WYID,
+  e.MATCH_WYID,
+  e.MINUTE,
+  e.SECOND,
+  e.LOCATIONX,
+  e.LOCATIONY,
+  e.TEAM_WYID,
+  e.OPPONENTTEAM_WYID,
+  e.PLAYER_WYID,
+  e.POSSESSIONDURATION,
+  s.SHOTISGOAL,
+  s.SHOTBODYPART,
+  ps.possession_start_type
+FROM wyscout_matchevents_shots s
+JOIN wyscout_matchevents_common e
+  ON s.EVENT_WYID = e.EVENT_WYID
+LEFT JOIN possession_start ps
+  ON e.POSSESSION_WYID = ps.POSSESSION_WYID
+ AND ps.rn = 1
+WHERE e.SEASON_WYID = 191611
+  AND LOWER(e.PRIMARYTYPE) = 'shot'
+  AND (e.TEAM_WYID = 7453 OR e.OPPONENTTEAM_WYID = 7453);
+") %>%
+  as_tibble() %>%
+  distinct(EVENT_WYID, .keep_all = TRUE)
+
+#### DEL 2 – BRUG VORES MODEL FRA 1.4 ####
+
+# I denne del bruges den XGBoost-model, der allerede er trænet i opgave 1.4:
+# xgb_model
+# train_x
+
+# Vi retræner derfor ikke modellen her.
+
+
+#### DEL 3 – TEST PÅ BRØNDBY I INDEVÆRENDE SÆSON ####
+
+# Feature engineering på Brøndby-data
+brondby_data <- brondby_raw %>%
+  mutate(
+    # målvariabel
+    is_goal = as.integer(
+      SHOTISGOAL == 1 | str_detect(tolower(SHOTBODYPART), "goal")
+    ),
+    
+    # rydder bodypart op og fjerner støj
+    bodypart_detail = case_when(
+      str_detect(tolower(SHOTBODYPART), "left_foot") ~ "left_foot",
+      str_detect(tolower(SHOTBODYPART), "right_foot") ~ "right_foot",
+      str_detect(tolower(SHOTBODYPART), "head") ~ "head",
+      str_detect(tolower(SHOTBODYPART), "head_or_other") ~ "head",
+      TRUE ~ NA_character_
+    ),
+    
+    # simpel version til modellen
+    bodypart = case_when(
+      bodypart_detail %in% c("left_foot", "right_foot") ~ "foot",
+      bodypart_detail == "head" ~ "head",
+      TRUE ~ NA_character_
+    ),
+    
+    # set piece-kategori
+    set_piece_category = case_when(
+      tolower(possession_start_type) == "corner" ~ "corner",
+      tolower(possession_start_type) %in% c("free_kick", "penalty") ~ "free_kick_or_penalty",
+      tolower(possession_start_type) %in% c("throw_in", "goal_kick") ~ "restart_other",
+      TRUE ~ "open_play"
+    ),
+    
+    # koordinater omregnes til meter
+    x_meter = LOCATIONX * 105 / 100,
+    y_meter = LOCATIONY * 68 / 100,
+    
+    # distance til mål
+    distance_meter = sqrt((105 - x_meter)^2 + (34 - y_meter)^2),
+    
+    # vinkel til mål
+    goal_left_y  = 34 - 7.32 / 2,
+    goal_right_y = 34 + 7.32 / 2,
+    
+    d_left  = sqrt((105 - x_meter)^2 + (goal_left_y - y_meter)^2),
+    d_right = sqrt((105 - x_meter)^2 + (goal_right_y - y_meter)^2),
+    
+    cos_angle = (d_left^2 + d_right^2 - 7.32^2) / (2 * d_left * d_right),
+    cos_angle = pmin(pmax(cos_angle, -1), 1),   # holder værdien mellem -1 og 1
+    
+    angle_deg = acos(cos_angle) * 180 / pi,
+    
+    possession_duration = POSSESSIONDURATION,
+    
+    # skud for eller imod Brøndby
+    shot_for_or_against = ifelse(
+      TEAM_WYID == 7453,
+      "Brøndby for",
+      "Brøndby against"
+    )
+  ) %>%
+  filter(
+    !is.na(bodypart),      # fjerner støj i bodypart
+    distance_meter < 60,   # fjerner ekstreme outliers
+    angle_deg < 120
+  ) %>%
+  mutate(
+    bodypart = factor(bodypart, levels = c("head", "foot", "other")),
+    set_piece_category = factor(
+      set_piece_category,
+      levels = c("open_play", "corner", "free_kick_or_penalty", "restart_other")
+    )
+  )
+
+# Samme model-features som i træningen
+brondby_x <- model.matrix(
+  is_goal ~ distance_meter + angle_deg + bodypart +
+    possession_duration + set_piece_category - 1,
+  data = brondby_data
+)
+
+# Sørger for at kolonner matcher træningsmodellen
+missing_cols <- setdiff(colnames(train_x), colnames(brondby_x))
+
+if (length(missing_cols) > 0) {
+  for (col in missing_cols) {
+    brondby_x <- cbind(brondby_x, 0)
+    colnames(brondby_x)[ncol(brondby_x)] <- col
+  }
+}
+
+brondby_x <- brondby_x[, colnames(train_x)]
+
+# Predikterer xG
+brondby_data$xg <- predict(xgb_model, brondby_x)
+
+# Overordnet opsummering
+summary_brondby <- brondby_data %>%
+  group_by(shot_for_or_against) %>%
+  summarise(
+    shots = n(),
+    goals = sum(is_goal),
+    total_xg = sum(xg),
+    avg_xg = mean(xg),
+    xg_diff = goals - total_xg,
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+summary_brondby
+
+# Mest farlige afslutninger
+top_shots_brondby <- brondby_data %>%
+  arrange(desc(xg)) %>%
+  select(
+    shot_for_or_against,
+    MATCH_WYID,
+    PLAYER_WYID,
+    MINUTE,
+    SECOND,
+    is_goal,
+    bodypart_detail,
+    bodypart,
+    set_piece_category,
+    distance_meter,
+    angle_deg,
+    possession_duration,
+    xg
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  slice_head(n = 15)
+
+top_shots_brondby
+
+
+#### DEL 4 – SHINY APP ####
+
+library(shiny)
+library(bslib)
+library(ggplot2)
+library(DT)
+library(tidyr)
+library(xgboost)
+library(scales)
+
+# top 10 vigtigste features
+importance_tbl <- xgb.importance(
+  model = xgb_model,
+  feature_names = colnames(train_x)
+) %>%
+  as_tibble() %>%
+  slice_max(order_by = Gain, n = 10) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+ui <- fluidPage(
+  theme = bs_theme(
+    version = 5,
+    bg = "#FFFBEA",
+    fg = "#002B7F",
+    primary = "#FFD200",
+    secondary = "#002B7F",
+    base_font = font_google("Inter")
+  ),
+  
+  tags$head(
+    tags$style(HTML("
+      body {
+        background-color: #FFFBEA;
+      }
+      .app-title {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 20px;
+      }
+      .app-title img {
+        height: 48px;
+      }
+      .app-title-text {
+        font-size: 30px;
+        font-weight: 700;
+        color: #002B7F;
+      }
+      .sidebar-box {
+        background: #fff7cc;
+        border-radius: 14px;
+        padding: 18px;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+        margin-bottom: 20px;
+      }
+      .kpi-box {
+        background: white;
+        border-left: 8px solid #FFD200;
+        border-radius: 14px;
+        padding: 16px;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+        margin-bottom: 15px;
+        min-height: 110px;
+      }
+      .kpi-title {
+        font-size: 14px;
+        color: #666;
+      }
+      .kpi-value {
+        font-size: 30px;
+        font-weight: 700;
+        color: #002B7F;
+        margin-top: 8px;
+      }
+      .section-box {
+        background: white;
+        border-radius: 16px;
+        padding: 18px;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+        margin-bottom: 20px;
+      }
+      .section-title {
+        font-size: 20px;
+        font-weight: 700;
+        color: #002B7F;
+        margin-bottom: 14px;
+      }
+    "))
+  ),
+  
+  fluidRow(
+    column(
+      12,
+      div(
+        class = "app-title",
+        tags$img(src = "brondby_logo.png"),
+        div(class = "app-title-text", "Brøndby IF xG Dashboard")
+      )
+    )
+  ),
+  
+  fluidRow(
+    column(
+      3,
+      div(
+        class = "sidebar-box",
+        selectInput(
+          "view_type",
+          "Vælg analyse",
+          choices = c("Alle", "Brøndby for", "Brøndby against"),
+          selected = "Alle"
+        ),
+        selectInput(
+          "bodypart_filter",
+          "Body part",
+          choices = c("Alle", "head", "foot", "other"),
+          selected = "Alle"
+        ),
+        selectInput(
+          "setpiece_filter",
+          "Set piece kategori",
+          choices = c("Alle", "open_play", "corner", "free_kick_or_penalty", "restart_other"),
+          selected = "Alle"
+        ),
+        selectInput(
+          "match_filter",
+          "Kamp",
+          choices = c("Alle", sort(unique(brondby_data$MATCH_WYID))),
+          selected = "Alle"
+        ),
+        selectInput(
+          "player_filter",
+          "Spiller",
+          choices = c("Alle", sort(unique(brondby_data$PLAYER_WYID))),
+          selected = "Alle"
+        ),
+        sliderInput(
+          "xg_min",
+          "Minimum xG",
+          min = 0,
+          max = 1,
+          value = 0,
+          step = 0.01
+        )
+      )
+    ),
+    
+    column(
+      9,
+      
+      fluidRow(
+        column(3, uiOutput("kpi_shots")),
+        column(3, uiOutput("kpi_goals")),
+        column(3, uiOutput("kpi_total_xg")),
+        column(3, uiOutput("kpi_avg_xg"))
+      ),
+      
+      div(
+        class = "section-box",
+        div(class = "section-title", "Overordnet opsummering"),
+        DTOutput("summary_table")
+      ),
+      
+      div(
+        class = "section-box",
+        div(class = "section-title", "Faktiske mål vs expected goals"),
+        plotOutput("goals_xg_plot", height = "360px")
+      ),
+      
+      div(
+        class = "section-box",
+        div(class = "section-title", "Skudkort: distance og vinkel"),
+        plotOutput("shot_plot", height = "450px")
+      ),
+      
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "section-box",
+            div(class = "section-title", "Feature importance"),
+            plotOutput("importance_plot", height = "420px")
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "section-box",
+            div(class = "section-title", "Vigtigste features"),
+            DTOutput("importance_table")
+          )
+        )
+      ),
+      
+      div(
+        class = "section-box",
+        div(class = "section-title", "Mest farlige afslutninger"),
+        DTOutput("top_shots")
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  filtered_data <- reactive({
+    df <- brondby_data
+    
+    if (input$view_type != "Alle") {
+      df <- df %>% filter(shot_for_or_against == input$view_type)
+    }
+    
+    if (input$bodypart_filter != "Alle") {
+      df <- df %>% filter(bodypart == input$bodypart_filter)
+    }
+    
+    if (input$setpiece_filter != "Alle") {
+      df <- df %>% filter(set_piece_category == input$setpiece_filter)
+    }
+    
+    if (input$match_filter != "Alle") {
+      df <- df %>% filter(MATCH_WYID == as.numeric(input$match_filter))
+    }
+    
+    if (input$player_filter != "Alle") {
+      df <- df %>% filter(PLAYER_WYID == as.numeric(input$player_filter))
+    }
+    
+    df %>% filter(xg >= input$xg_min)
+  })
+  
+  summary_filtered <- reactive({
+    filtered_data() %>%
+      group_by(shot_for_or_against) %>%
+      summarise(
+        shots = n(),
+        goals = sum(is_goal),
+        total_xg = sum(xg),
+        avg_xg = mean(xg),
+        xg_diff = goals - total_xg,
+        .groups = "drop"
+      ) %>%
+      mutate(across(where(is.numeric), ~ round(.x, 3)))
+  })
+  
+  output$kpi_shots <- renderUI({
+    div(class = "kpi-box",
+        div(class = "kpi-title", "Skud"),
+        div(class = "kpi-value", nrow(filtered_data())))
+  })
+  
+  output$kpi_goals <- renderUI({
+    div(class = "kpi-box",
+        div(class = "kpi-title", "Mål"),
+        div(class = "kpi-value", sum(filtered_data()$is_goal)))
+  })
+  
+  output$kpi_total_xg <- renderUI({
+    div(class = "kpi-box",
+        div(class = "kpi-title", "Samlet xG"),
+        div(class = "kpi-value", round(sum(filtered_data()$xg), 2)))
+  })
+  
+  output$kpi_avg_xg <- renderUI({
+    div(class = "kpi-box",
+        div(class = "kpi-title", "Gns. xG pr. skud"),
+        div(class = "kpi-value", round(mean(filtered_data()$xg), 3)))
+  })
+  
+  output$summary_table <- renderDT({
+    datatable(
+      summary_filtered(),
+      rownames = FALSE,
+      options = list(dom = "t", pageLength = 5)
+    )
+  })
+  
+  output$goals_xg_plot <- renderPlot({
+    plot_df <- summary_filtered() %>%
+      select(shot_for_or_against, goals, total_xg) %>%
+      pivot_longer(cols = c(goals, total_xg), names_to = "type", values_to = "value")
+    
+    ggplot(plot_df, aes(x = shot_for_or_against, y = value, fill = type)) +
+      geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+      scale_fill_manual(values = c("goals" = "#002B7F", "total_xg" = "#FFD200")) +
+      labs(x = NULL, y = "Værdi", fill = NULL) +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$shot_plot <- renderPlot({
+    ggplot(filtered_data(), aes(x = distance_meter, y = angle_deg)) +
+      geom_point(aes(color = xg, shape = factor(is_goal)), alpha = 0.8, size = 3) +
+      scale_color_gradient(low = "#FFE680", high = "#002B7F") +
+      labs(
+        x = "Distance til mål",
+        y = "Vinkel",
+        color = "xG",
+        shape = "Udfald"
+      ) +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$importance_plot <- renderPlot({
+    ggplot(
+      importance_tbl %>% mutate(Feature = reorder(Feature, Gain)),
+      aes(x = Feature, y = Gain)
+    ) +
+      geom_col(fill = "#002B7F") +
+      coord_flip() +
+      labs(x = NULL, y = "Gain") +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$importance_table <- renderDT({
+    datatable(
+      importance_tbl,
+      rownames = FALSE,
+      options = list(dom = "t", pageLength = 10)
+    )
+  })
+  
+  output$top_shots <- renderDT({
+    filtered_data() %>%
+      arrange(desc(xg)) %>%
+      select(
+        shot_for_or_against,
+        MATCH_WYID,
+        PLAYER_WYID,
+        MINUTE,
+        SECOND,
+        is_goal,
+        bodypart,
+        set_piece_category,
+        distance_meter,
+        angle_deg,
+        possession_duration,
+        xg
+      ) %>%
+      mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+      slice_head(n = 15) %>%
+      datatable(rownames = FALSE, options = list(pageLength = 15))
+  })
+}
+
+shinyApp(ui, server)
+

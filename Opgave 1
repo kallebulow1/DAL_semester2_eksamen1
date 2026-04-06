@@ -84,12 +84,19 @@ table(shots_clean$SHOTBODYPART)
 ## -----------------------------
 shots_clean <- shots_clean %>%
   mutate(
-    bodypart = case_when(
+    # detaljeret (til analyse)
+    bodypart_detail = case_when(
+      str_detect(tolower(SHOTBODYPART), "left") ~ "left_foot",
+      str_detect(tolower(SHOTBODYPART), "right") ~ "right_foot",
       str_detect(tolower(SHOTBODYPART), "head") ~ "head",
-      str_detect(tolower(SHOTBODYPART), "left") ~ "foot",
-      str_detect(tolower(SHOTBODYPART), "right") ~ "foot",
-      str_detect(tolower(SHOTBODYPART), "foot") ~ "foot",
-      TRUE ~ NA_character_   # <-- vigtigt: sæt støj til NA
+      TRUE ~ NA_character_
+    ),
+    
+    # simpel (til model)
+    bodypart = case_when(
+      bodypart_detail %in% c("left_foot", "right_foot") ~ "foot",
+      bodypart_detail == "head" ~ "head",
+      TRUE ~ NA_character_
     )
   )
 
@@ -142,12 +149,14 @@ shots_clean <- shots_clean %>%
 xg_data <- shots_clean %>%
   filter(
     !is.na(is_goal), # fjern rækker uden mål-label
-    !is.na(distance_meter), # fjern rækker uden mål-label
-    !is.na(angle_deg), 
+    !is.na(distance_meter), 
+    !is.na(angle_deg),
+    !is.na(bodypart),
+    !is.na(set_piece_category),
+    !is.na(possession_duration),
     distance_meter < 60,
     angle_deg < 120
   )
-
 ## -----------------------------
 ## 7) Udvælg relevante variable
 ## -----------------------------
@@ -161,6 +170,7 @@ xg_data <- xg_data %>%
     MINUTE,
     SECOND,
     is_goal,
+    bodypart_detail,
     bodypart,
     distance_meter,
     angle_deg,
@@ -1198,25 +1208,28 @@ WHERE e.SEASON_WYID = 191611
 # Feature engineering på Brøndby-data
 brondby_data <- brondby_raw %>%
   mutate(
-    # målvariabel
-    is_goal = as.integer(
-      SHOTISGOAL == 1 | str_detect(tolower(SHOTBODYPART), "goal")
-    ),
+    # 🔧 RENS DATA (MEGET VIGTIG)
+    clean_bodypart = str_replace_all(SHOTBODYPART, "[\\[\\]\\n\",]", ""),
+    clean_bodypart = str_trim(clean_bodypart),
     
-    # rydder bodypart op og fjerner støj
+    # KORREKT målvariabel
+    is_goal = as.integer(clean_bodypart == "goal"),
+    
+    # rydder bodypart op
     bodypart_detail = case_when(
-      str_detect(tolower(SHOTBODYPART), "left_foot") ~ "left_foot",
-      str_detect(tolower(SHOTBODYPART), "right_foot") ~ "right_foot",
-      str_detect(tolower(SHOTBODYPART), "head") ~ "head",
-      str_detect(tolower(SHOTBODYPART), "head_or_other") ~ "head",
+      str_detect(clean_bodypart, "left") ~ "left_foot",
+      str_detect(clean_bodypart, "right") ~ "right_foot",
+      str_detect(clean_bodypart, "head") ~ "head",
+      clean_bodypart == "goal" ~ "goal",
       TRUE ~ NA_character_
     ),
     
-    # simpel version til modellen
+    # simpel version til model
     bodypart = case_when(
       bodypart_detail %in% c("left_foot", "right_foot") ~ "foot",
       bodypart_detail == "head" ~ "head",
-      TRUE ~ NA_character_
+      bodypart_detail == "goal" ~ "foot",
+      TRUE ~ "other"
     ),
     
     # set piece-kategori
@@ -1230,6 +1243,7 @@ brondby_data <- brondby_raw %>%
     # koordinater omregnes til meter
     x_meter = LOCATIONX * 105 / 100,
     y_meter = LOCATIONY * 68 / 100,
+    goal_center_distance = abs(y_meter - 34),
     
     # distance til mål
     distance_meter = sqrt((105 - x_meter)^2 + (34 - y_meter)^2),
@@ -1256,8 +1270,7 @@ brondby_data <- brondby_raw %>%
     )
   ) %>%
   filter(
-    !is.na(bodypart),      # fjerner støj i bodypart
-    distance_meter < 60,   # fjerner ekstreme outliers
+    distance_meter < 60,
     angle_deg < 120
   ) %>%
   mutate(
@@ -1270,7 +1283,7 @@ brondby_data <- brondby_raw %>%
 
 # Samme model-features som i træningen
 brondby_x <- model.matrix(
-  is_goal ~ distance_meter + angle_deg + bodypart +
+  is_goal ~ distance_meter + angle_deg + goal_center_distance + bodypart +
     possession_duration + set_piece_category - 1,
   data = brondby_data
 )
@@ -1288,7 +1301,13 @@ if (length(missing_cols) > 0) {
 brondby_x <- brondby_x[, colnames(train_x)]
 
 # Predikterer xG
-brondby_data$xg <- predict(xgb_model, brondby_x)
+
+# kalibrer
+raw_xg <- predict(xgb_model, brondby_x)
+
+scaling_factor <- sum(brondby_data$is_goal) / sum(raw_xg)
+
+brondby_data$xg <- raw_xg * scaling_factor
 
 # Overordnet opsummering
 summary_brondby <- brondby_data %>%

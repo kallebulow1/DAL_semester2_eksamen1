@@ -1,0 +1,1100 @@
+library(DBI)
+library(RMariaDB)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(shiny)
+
+# ---- Opgave 3.2 ----
+
+# ---- Connection ----
+con3 <- dbConnect(
+  RMariaDB::MariaDB(),
+  host = "www.talmedos.com",
+  port = 3306,
+  user = "dalremote",
+  password = "OttoRehagel123456789Long2026!",
+  dbname = "superliga2"
+)
+
+# ---- Hent kampdata ----
+kamp_data_query <- dbGetQuery(con3, "
+SELECT
+  g.MATCH_WYID,
+  g.TEAM_WYID,
+  t.TEAMNAME,
+  g.SHOTS,
+  g.FOULS,
+  g.CORNERS,
+  g.REDCARDS,
+  g.YELLOWCARDS,
+  g.OFFSIDES,
+  g.DRIBBLES,
+  g.GOALS,
+  g.XGPERSHOT,
+  g.AVGDISTANCE,
+  g.XG,
+  g.PROGRESSIVERUNS,
+  g.TOUCHESINBOX,
+  g.FOULSSUFFERED,
+  g.SHOTSONTARGET,
+  g.SHOTSBLOCKED,
+  g.SHOTSOUTSIDEBOX,
+  g.SHOTSOUTSIDEBOXONTARGET,
+  g.SHOTSONPOST,
+  g.SHOTSWIDE,
+  g.SHOTSFROMBOX,
+  g.SHOTSFROMBOXONTARGET,
+  g.FREEKICKS,
+  g.SHOTSFROMDANGERZONE,
+  g.TOTALTHROWINS,
+  g.LEFTTHROWINS,
+  g.RIGHTTHROWINS,
+  m.SEASON_WYID
+FROM wyscout_matchadvancedstats_general g
+JOIN wyscout_matches m
+  ON g.MATCH_WYID = m.MATCH_WYID
+LEFT JOIN wyscout_teams t
+  ON g.TEAM_WYID = t.TEAM_WYID
+WHERE m.SEASON_WYID = 191611
+") %>%
+  as_tibble()
+
+str(kamp_data_query)
+
+# ---- Fjern dubletter ----
+kamp_data <- kamp_data_query %>%
+  distinct(MATCH_WYID, TEAM_WYID, .keep_all = TRUE)
+
+# ---- Lav modstander-data ----
+modstander_data <- kamp_data %>%
+  select(MATCH_WYID, TEAM_WYID, TEAMNAME, GOALS) %>%
+  rename(
+    opponent_team_wyid = TEAM_WYID,
+    opponent_name = TEAMNAME,
+    goals_against = GOALS
+  )
+
+# ---- Join modstander på ----
+kamp_data <- kamp_data %>%
+  left_join(modstander_data, by = "MATCH_WYID") %>%
+  filter(TEAM_WYID != opponent_team_wyid) %>%
+  distinct(MATCH_WYID, TEAM_WYID, .keep_all = TRUE)
+
+# ---- Lav resultat ----
+kamp_data <- kamp_data %>%
+  mutate(
+    result = case_when(
+      GOALS > goals_against ~ "Sejr",
+      GOALS == goals_against ~ "Uafgjort",
+      GOALS < goals_against ~ "Nederlag"
+    ),
+    points = case_when(
+      GOALS > goals_against ~ 3,
+      GOALS == goals_against ~ 1,
+      GOALS < goals_against ~ 0
+    )
+  )
+
+# ---- Vælg variable til clustering ----
+cluster_data <- kamp_data %>%
+  select(
+    SHOTS,
+    FOULS,
+    CORNERS,
+    REDCARDS,
+    YELLOWCARDS,
+    OFFSIDES,
+    DRIBBLES,
+    GOALS,
+    AVGDISTANCE,
+    XG,
+    PROGRESSIVERUNS,
+    TOUCHESINBOX,
+    FREEKICKS,
+    TOTALTHROWINS,
+  )
+
+# ---- Fjern rækker med NA i cluster-variabler ----
+kamp_data <- kamp_data %>%
+  filter(complete.cases(cluster_data))
+
+cluster_data <- kamp_data %>%
+  select(
+    SHOTS,
+    FOULS,
+    CORNERS,
+    REDCARDS,
+    YELLOWCARDS,
+    OFFSIDES,
+    DRIBBLES,
+    GOALS,
+    AVGDISTANCE,
+    XG,
+    PROGRESSIVERUNS,
+    TOUCHESINBOX,
+    FREEKICKS,
+    TOTALTHROWINS,
+  )
+
+# ---- Standardiser data ----
+cluster_scaled <- scale(cluster_data)
+
+# ---- Elbow plot data ----
+wss <- numeric(8) 
+set.seed(123)
+for (k in 1:8) {
+  wss[k] <- kmeans(cluster_scaled, centers = k, nstart = 30)$tot.withinss
+}
+
+elbow_df <- data.frame(
+  k = 1:8,
+  wss = wss
+)
+
+# ---- elbow plot ----
+ggplot(elbow_df, aes(x = k, y = wss)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 2, linetype = "dashed", linewidth = 1) +
+  scale_x_continuous(breaks = 1:8) +
+  labs(
+    title = "Elbow plot for valg af antal cluster",
+    subtitle = "Et muligt knæk ses ved c = 2",
+    x = "Antal cluster (c)",
+    y = "WSS"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 22, face = "bold"),
+    plot.subtitle = element_text(size = 16),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 13)
+  )
+
+# ---- K-means med 2 clusters ----
+set.seed(123)
+k_model <- kmeans(cluster_scaled, centers = 2, nstart = 50)
+
+kamp_data$cluster <- as.factor(k_model$cluster)
+
+# ---- Navngiv clusters ----
+cluster_summary_raw <- kamp_data %>%
+  group_by(cluster) %>%
+  summarise(
+    shots = mean(SHOTS, na.rm = TRUE),
+    xg = mean(XG, na.rm = TRUE),
+    goals = mean(GOALS, na.rm = TRUE),
+    shots_on_target = mean(SHOTSONTARGET, na.rm = TRUE),
+    touches_in_box = mean(TOUCHESINBOX, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(cluster_summary_raw)
+
+# ---- Justér navnene hvis nødvendigt efter print ----
+cluster_labels <- c(
+  "2" = "Åbne og chanceprægede kampe",
+  "1" = "Lukkede og chancefattige kampe"
+)
+
+kamp_data <- kamp_data %>%
+  mutate(cluster_name = recode(cluster, !!!cluster_labels))
+
+# ---- Cluster summary pæn tabel ----
+cluster_summary_kamp <- kamp_data %>%
+  group_by(cluster, cluster_name) %>%
+  summarise(
+    antal_rækker = n(),
+    shots = round(mean(SHOTS, na.rm = TRUE), 2),
+    xg = round(mean(XG, na.rm = TRUE), 2),
+    goals = round(mean(GOALS, na.rm = TRUE), 2),
+    shots_on_target = round(mean(SHOTSONTARGET, na.rm = TRUE), 2),
+    dribbles = round(mean(DRIBBLES, na.rm = TRUE), 2),
+    touches_in_box = round(mean(TOUCHESINBOX, na.rm = TRUE), 2),
+    fouls = round(mean(FOULS, na.rm = TRUE), 2),
+    avgdistance = round(mean(AVGDISTANCE, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+# ---- Scatter plot ----
+ggplot(kamp_data, aes(x = XG, y = SHOTS, color = cluster_name)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Lukkede og chancefattige kampe" = "#1f77b4",
+    "Åbne og chanceprægede kampe" = "#2ca02c"
+  )) +
+  labs(
+    title = "Kampprofiler i indeværende sæson",
+    subtitle = "Sammenhæng mellem xG og antal skud",
+    x = "xG",
+    y = "Antal skud",
+    color = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 22, face = "bold"),
+    plot.subtitle = element_text(size = 16),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 13),
+    legend.title = element_text(size = 15),
+    legend.text = element_text(size = 13),
+    legend.position = "bottom"
+  )
+
+# ---- Modstander analyse ----
+# Viser hvor ofte hvert hold havner i hvert cluster mod forskellige modstandere.
+modstander_cluster_tabel <- kamp_data %>%
+  group_by(TEAMNAME, opponent_name, cluster_name) %>%
+  summarise(antal_kampe = n(), .groups = "drop") %>%
+  arrange(TEAMNAME, opponent_name, cluster_name)
+
+# Gør det nemmere at sammenligne ved at gøre det til andele
+modstander_cluster_andel <- kamp_data %>%
+  group_by(TEAMNAME, opponent_name, cluster_name) %>%
+  summarise(antal_kampe = n(), .groups = "drop") %>%
+  group_by(TEAMNAME, opponent_name) %>%
+  mutate(
+    andel = antal_kampe / sum(antal_kampe)
+  ) %>%
+  ungroup() %>%
+  arrange(TEAMNAME, opponent_name, desc(andel))
+
+# ---- Gns. nøgetal for brøndby
+# Vælg hold
+valgt_hold <- "Brøndby"
+
+# Lav tabel med gennemsnitlige kampnøgletal mod hver modstander
+# ---- Kort og rapportvenlig tabel ----
+modstander_gennemsnit_kort <- kamp_data %>%
+  filter(TEAMNAME == valgt_hold) %>%
+  group_by(opponent_name) %>%
+  summarise(
+    antal_kampe = n(),
+    shots = round(mean(SHOTS, na.rm = TRUE), 2),
+    xg = round(mean(XG, na.rm = TRUE), 2),
+    shots_on_target = round(mean(SHOTSONTARGET, na.rm = TRUE), 2),
+    goals = round(mean(GOALS, na.rm = TRUE), 2),
+    touches_in_box = round(mean(TOUCHESINBOX, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(xg))
+
+# Plot af tabellen
+modstander_cluster_plot <- kamp_data %>%
+  filter(TEAMNAME == valgt_hold) %>%
+  group_by(opponent_name, cluster_name) %>%
+  summarise(antal_kampe = n(), .groups = "drop")
+
+ggplot(modstander_cluster_plot,
+       aes(x = opponent_name, y = antal_kampe, fill = cluster_name)) +
+  geom_col(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c(
+    "Lukkede og chancefattige kampe" = "#1f77b4",
+    "Åbne og chanceprægede kampe" = "#2ca02c"
+  )) +
+  labs(
+    title = paste("Kamptyper mod modstandere -", valgt_hold),
+    subtitle = "Fordeling af lukkede og åbne kampe",
+    x = "Modstander",
+    y = "Andel af kampe",
+    fill = "Kamptype"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 14),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+
+
+
+
+
+# ---- UI ----
+# ---- Shiny UI ----
+# ---- Brøndby kampdata ----
+library(DBI)
+library(RMariaDB)
+library(dplyr)
+library(plotly)
+library(shiny)
+library(scales)
+library(tidyr)
+library(DT)
+library(bslib)
+library(ggplot2)
+library(tibble)
+
+
+brondby_kampe <- kamp_data %>%
+  filter(grepl("Brøndby", TEAMNAME, ignore.case = TRUE))
+
+# ---- Farver ----
+brondby_blue <- "#003DA5"
+brondby_yellow <- "#FFD100"
+light_bg <- "#F7F8FC"
+card_bg <- "#FFFFFF"
+text_dark <- "#1F2937"
+muted_text <- "#6B7280"
+soft_yellow <- "#FFF4B8"
+
+cluster_colors <- c(
+  "Lukkede og chancefattige kampe" = "#003DA5",
+  "Åbne og chanceprægede kampe" = "#FFD100"
+)
+
+result_colors <- c(
+  "Sejr" = "#16A34A",
+  "Uafgjort" = "#F59E0B",
+  "Nederlag" = "#DC2626"
+)
+
+# ---- Labels ----
+pretty_var <- function(x) {
+  dplyr::case_when(
+    x == "XG" ~ "xG",
+    x == "SHOTS" ~ "Antal skud",
+    x == "GOALS" ~ "Mål",
+    x == "SHOTSONTARGET" ~ "Skud på mål",
+    x == "TOUCHESINBOX" ~ "Berøringer i feltet",
+    x == "DRIBBLES" ~ "Driblinger",
+    x == "FOULS" ~ "Begåede frispark",
+    x == "CORNERS" ~ "Hjørnespark",
+    x == "PROGRESSIVERUNS" ~ "Progressive løb",
+    x == "AVGDISTANCE" ~ "Gns. afslutningsafstand",
+    x == "FREEKICKS" ~ "Frispark",
+    x == "TOTALTHROWINS" ~ "Indkast i alt",
+    TRUE ~ x
+  )
+}
+
+# ---- UI ----
+ui <- fluidPage(
+  theme = bs_theme(
+    version = 5,
+    primary = brondby_blue,
+    secondary = brondby_yellow,
+    bg = light_bg,
+    fg = text_dark,
+    base_font = font_google("Inter")
+  ),
+  
+  tags$head(
+    tags$style(HTML(paste0("
+      body {
+        background-color: ", light_bg, ";
+      }
+
+      .top-banner {
+        background: linear-gradient(90deg, ", brondby_blue, " 0%, ", brondby_yellow, " 100%);
+        color: white;
+        border-radius: 18px;
+        padding: 26px 30px;
+        margin-bottom: 20px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.10);
+      }
+
+      .top-banner h1 {
+        margin: 0;
+        font-size: 30px;
+        font-weight: 800;
+      }
+
+      .top-banner p {
+        margin: 8px 0 0 0;
+        font-size: 15px;
+        opacity: 0.95;
+      }
+
+      .sidebar-panel, .content-card, .kpi-card {
+        background: ", card_bg, ";
+        border-radius: 16px;
+        box-shadow: 0 8px 22px rgba(0,0,0,0.06);
+        border: none;
+      }
+
+      .sidebar-panel {
+        padding: 18px;
+      }
+
+      .content-card {
+        padding: 18px;
+        margin-bottom: 18px;
+      }
+
+      .kpi-card {
+        padding: 18px 20px;
+        min-height: 125px;
+        margin-bottom: 16px;
+        border-left: 8px solid ", brondby_yellow, ";
+        background: linear-gradient(180deg, #FFFFFF 0%, ", soft_yellow, " 100%);
+      }
+
+      .kpi-title {
+        font-size: 13px;
+        font-weight: 700;
+        color: ", muted_text, ";
+        margin-bottom: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .kpi-value {
+        font-size: 30px;
+        font-weight: 800;
+        color: ", brondby_blue, ";
+        line-height: 1.1;
+      }
+
+      .kpi-sub {
+        margin-top: 8px;
+        font-size: 13px;
+        color: ", muted_text, ";
+      }
+
+      .section-title {
+        font-size: 18px;
+        font-weight: 800;
+        color: ", brondby_blue, ";
+        margin-bottom: 12px;
+      }
+
+      .nav-tabs .nav-link {
+        border: none !important;
+        color: ", text_dark, ";
+        font-weight: 700;
+        margin-right: 8px;
+        border-radius: 10px !important;
+        background-color: #F3F4F6;
+      }
+
+      .nav-tabs .nav-link.active {
+        background-color: ", brondby_yellow, " !important;
+        color: ", brondby_blue, " !important;
+      }
+
+      .control-label {
+        font-weight: 700;
+        color: ", text_dark, ";
+      }
+
+      .irs-bar, .irs-single, .irs-from, .irs-to {
+        background: ", brondby_yellow, ";
+        border-color: ", brondby_yellow, ";
+        color: ", brondby_blue, ";
+      }
+
+      .irs-handle {
+        border-color: ", brondby_blue, ";
+      }
+
+      .selectize-input {
+        border-radius: 10px !important;
+      }
+    ")))
+  ),
+  
+  div(
+    class = "top-banner",
+    h1("Brøndby IF – Kampdashboard"),
+    p("Interaktiv analyse af kamptyper, resultater og modstanderbilleder i indeværende sæson")
+  ),
+  
+  fluidRow(
+    column(
+      width = 3,
+      div(
+        class = "sidebar-panel",
+        h4(class = "section-title", "Fælles filtre"),
+        
+        selectInput(
+          "result_filter",
+          "Resultat",
+          choices = c("Alle", "Sejr", "Uafgjort", "Nederlag"),
+          selected = "Alle"
+        ),
+        
+        selectInput(
+          "cluster_filter",
+          "Kamptype",
+          choices = c("Alle", sort(unique(kamp_data$cluster_name))),
+          selected = "Alle"
+        ),
+        
+        selectInput(
+          "xvar",
+          "X-akse",
+          choices = c(
+            "xG" = "XG",
+            "Antal skud" = "SHOTS",
+            "Mål" = "GOALS",
+            "Skud på mål" = "SHOTSONTARGET",
+            "Berøringer i feltet" = "TOUCHESINBOX",
+            "Driblinger" = "DRIBBLES",
+            "Progressive løb" = "PROGRESSIVERUNS",
+            "Gns. afslutningsafstand" = "AVGDISTANCE",
+            "Begåede frispark" = "FOULS",
+            "Hjørnespark" = "CORNERS"
+          ),
+          selected = "XG"
+        ),
+        
+        selectInput(
+          "yvar",
+          "Y-akse",
+          choices = c(
+            "Antal skud" = "SHOTS",
+            "xG" = "XG",
+            "Mål" = "GOALS",
+            "Skud på mål" = "SHOTSONTARGET",
+            "Berøringer i feltet" = "TOUCHESINBOX",
+            "Driblinger" = "DRIBBLES",
+            "Progressive løb" = "PROGRESSIVERUNS",
+            "Gns. afslutningsafstand" = "AVGDISTANCE",
+            "Begåede frispark" = "FOULS",
+            "Hjørnespark" = "CORNERS"
+          ),
+          selected = "SHOTS"
+        )
+      )
+    ),
+    
+    column(
+      width = 9,
+      
+      tabsetPanel(
+        tabPanel(
+          "Brøndby",
+          br(),
+          
+          fluidRow(
+            column(3, uiOutput("kpi_matches")),
+            column(3, uiOutput("kpi_points")),
+            column(3, uiOutput("kpi_xg")),
+            column(3, uiOutput("kpi_goals"))
+          ),
+          
+          fluidRow(
+            column(
+              12,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Brøndbys kampe i kamp-rummet"),
+                plotlyOutput("brondby_scatter", height = "520px")
+              )
+            )
+          ),
+          
+          fluidRow(
+            column(
+              6,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Fordeling af kamptyper"),
+                plotOutput("cluster_bar", height = "280px")
+              )
+            ),
+            column(
+              6,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Brøndby vs. ligaen"),
+                plotOutput("compare_plot", height = "280px")
+              )
+            )
+          ),
+          
+          fluidRow(
+            column(
+              6,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Resultatfordeling"),
+                plotOutput("result_bar", height = "280px")
+              )
+            ),
+            column(
+              6,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Kamptyper mod modstandere"),
+                plotOutput("opponent_cluster_plot", height = "280px")
+              )
+            )
+          ),
+          
+          div(
+            class = "content-card",
+            h4(class = "section-title", "Brøndbys kampoversigt"),
+            DTOutput("brondby_table")
+          )
+        ),
+        
+        tabPanel(
+          "Liga / scouting",
+          br(),
+          
+          div(
+            class = "content-card",
+            h4(class = "section-title", "Kampprofiler på tværs af ligaen"),
+            
+            fluidRow(
+              column(
+                4,
+                selectInput(
+                  "league_team_filter",
+                  "Vælg hold",
+                  choices = c("Alle", sort(unique(kamp_data$TEAMNAME))),
+                  selected = "Alle"
+                )
+              ),
+              column(
+                4,
+                selectInput(
+                  "league_result_filter",
+                  "Vælg resultat",
+                  choices = c("Alle", "Sejr", "Uafgjort", "Nederlag"),
+                  selected = "Alle"
+                )
+              ),
+              column(
+                4,
+                selectInput(
+                  "league_cluster_filter",
+                  "Vælg kamptype",
+                  choices = c("Alle", sort(unique(kamp_data$cluster_name))),
+                  selected = "Alle"
+                )
+              )
+            ),
+            
+            plotlyOutput("league_scatter", height = "520px")
+          ),
+          
+          div(
+            class = "content-card",
+            h4(class = "section-title", "Ligaoversigt over kampe"),
+            DTOutput("league_table")
+          )
+        ),
+        
+        tabPanel(
+          "Model",
+          br(),
+          div(
+            class = "content-card",
+            h4(class = "section-title", "Valg af antal clusters"),
+            plotOutput("elbow", height = "420px")
+          ),
+          div(
+            class = "content-card",
+            h4(class = "section-title", "Clusteroversigt"),
+            DTOutput("cluster_summary_table")
+          )
+        )
+      )
+    )
+  )
+)
+
+# ---- SERVER ----
+server <- function(input, output, session) {
+  
+  filtered_brondby <- reactive({
+    data <- kamp_data %>%
+      filter(grepl("Brøndby", TEAMNAME, ignore.case = TRUE))
+    
+    if (input$result_filter != "Alle") {
+      data <- data %>% filter(result == input$result_filter)
+    }
+    
+    if (input$cluster_filter != "Alle") {
+      data <- data %>% filter(cluster_name == input$cluster_filter)
+    }
+    
+    data
+  })
+  
+  league_data <- reactive({
+    data <- kamp_data
+    
+    if (input$league_team_filter != "Alle") {
+      data <- data %>% filter(TEAMNAME == input$league_team_filter)
+    }
+    
+    if (input$league_result_filter != "Alle") {
+      data <- data %>% filter(result == input$league_result_filter)
+    }
+    
+    if (input$league_cluster_filter != "Alle") {
+      data <- data %>% filter(cluster_name == input$league_cluster_filter)
+    }
+    
+    data
+  })
+  
+  output$kpi_matches <- renderUI({
+    div(
+      class = "kpi-card",
+      div(class = "kpi-title", "Kampe i visningen"),
+      div(class = "kpi-value", nrow(filtered_brondby())),
+      div(class = "kpi-sub", "Antal Brøndby-kampe efter filter")
+    )
+  })
+  
+  output$kpi_points <- renderUI({
+    val <- sum(filtered_brondby()$points, na.rm = TRUE)
+    div(
+      class = "kpi-card",
+      div(class = "kpi-title", "Point"),
+      div(class = "kpi-value", val),
+      div(class = "kpi-sub", "Samlede point i de viste kampe")
+    )
+  })
+  
+  output$kpi_xg <- renderUI({
+    val <- mean(filtered_brondby()$XG, na.rm = TRUE)
+    div(
+      class = "kpi-card",
+      div(class = "kpi-title", "Gns. xG"),
+      div(class = "kpi-value", round(val, 2)),
+      div(class = "kpi-sub", "Brøndbys gennemsnitlige xG")
+    )
+  })
+  
+  output$kpi_goals <- renderUI({
+    val <- mean(filtered_brondby()$GOALS, na.rm = TRUE)
+    div(
+      class = "kpi-card",
+      div(class = "kpi-title", "Gns. mål"),
+      div(class = "kpi-value", round(val, 2)),
+      div(class = "kpi-sub", "Brøndbys gennemsnitlige antal mål")
+    )
+  })
+  
+  output$brondby_scatter <- renderPlotly({
+    req(nrow(filtered_brondby()) > 0)
+    req(input$xvar != input$yvar)
+    
+    plot_ly(
+      data = filtered_brondby(),
+      x = as.formula(paste0("~", input$xvar)),
+      y = as.formula(paste0("~", input$yvar)),
+      color = ~cluster_name,
+      colors = cluster_colors,
+      type = "scatter",
+      mode = "markers",
+      marker = list(size = 12, opacity = 0.85),
+      text = ~paste0(
+        "<b>", TEAMNAME, "</b>",
+        "<br>Modstander: ", opponent_name,
+        "<br>Resultat: ", result,
+        "<br>Kamptype: ", cluster_name,
+        "<br>Point: ", points,
+        "<br>xG: ", round(XG, 2),
+        "<br>Skud: ", SHOTS,
+        "<br>Skud på mål: ", SHOTSONTARGET,
+        "<br>Mål: ", GOALS,
+        "<br>Berøringer i feltet: ", TOUCHESINBOX,
+        "<br>Driblinger: ", DRIBBLES,
+        "<br>Progressive løb: ", PROGRESSIVERUNS,
+        "<br>Gns. afslutningsafstand: ", round(AVGDISTANCE, 2)
+      ),
+      hoverinfo = "text"
+    ) %>%
+      layout(
+        title = list(text = "<b>Brøndbys kampprofiler</b>"),
+        xaxis = list(title = pretty_var(input$xvar)),
+        yaxis = list(title = pretty_var(input$yvar)),
+        legend = list(orientation = "h", x = 0.05, y = -0.15),
+        plot_bgcolor = "white",
+        paper_bgcolor = "white"
+      )
+  })
+  
+  output$cluster_bar <- renderPlot({
+    all_clusters <- data.frame(
+      cluster_name = c(
+        "Lukkede og chancefattige kampe",
+        "Åbne og chanceprægede kampe"
+      )
+    )
+    
+    cluster_df <- filtered_brondby() %>%
+      count(cluster_name) %>%
+      right_join(all_clusters, by = "cluster_name") %>%
+      mutate(n = ifelse(is.na(n), 0, n))
+    
+    ggplot(cluster_df, aes(x = cluster_name, y = n, fill = cluster_name)) +
+      geom_col(width = 0.7) +
+      scale_fill_manual(values = cluster_colors) +
+      labs(
+        x = NULL,
+        y = "Antal kampe"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 12, hjust = 1, face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  output$compare_plot <- renderPlot({
+    br <- filtered_brondby() %>%
+      summarise(
+        XG = mean(XG, na.rm = TRUE),
+        SHOTS = mean(SHOTS, na.rm = TRUE),
+        GOALS = mean(GOALS, na.rm = TRUE)
+      ) %>%
+      mutate(type = "Brøndby")
+    
+    lg <- kamp_data %>%
+      summarise(
+        XG = mean(XG, na.rm = TRUE),
+        SHOTS = mean(SHOTS, na.rm = TRUE),
+        GOALS = mean(GOALS, na.rm = TRUE)
+      ) %>%
+      mutate(type = "Liga")
+    
+    compare_df <- bind_rows(br, lg) %>%
+      pivot_longer(
+        cols = c(XG, SHOTS, GOALS),
+        names_to = "metric",
+        values_to = "value"
+      ) %>%
+      mutate(
+        metric = recode(
+          metric,
+          "XG" = "xG",
+          "SHOTS" = "Skud",
+          "GOALS" = "Mål"
+        )
+      )
+    
+    ggplot(compare_df, aes(x = metric, y = value, fill = type)) +
+      geom_col(position = "dodge", width = 0.7) +
+      scale_fill_manual(values = c("Brøndby" = brondby_yellow, "Liga" = "#C7CED9")) +
+      labs(
+        x = NULL,
+        y = NULL,
+        fill = NULL
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        legend.position = "bottom",
+        axis.text.x = element_text(face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  output$result_bar <- renderPlot({
+    result_df <- filtered_brondby() %>%
+      count(result)
+    
+    all_results <- data.frame(result = c("Sejr", "Uafgjort", "Nederlag"))
+    
+    result_df <- all_results %>%
+      left_join(result_df, by = "result") %>%
+      mutate(n = ifelse(is.na(n), 0, n))
+    
+    ggplot(result_df, aes(x = result, y = n, fill = result)) +
+      geom_col(width = 0.7) +
+      scale_fill_manual(values = result_colors) +
+      labs(
+        x = NULL,
+        y = "Antal kampe"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  output$opponent_cluster_plot <- renderPlot({
+    req(nrow(filtered_brondby()) > 0)
+    
+    plot_df <- filtered_brondby() %>%
+      group_by(opponent_name, cluster_name) %>%
+      summarise(antal_kampe = n(), .groups = "drop")
+    
+    ggplot(plot_df, aes(x = opponent_name, y = antal_kampe, fill = cluster_name)) +
+      geom_col(position = "fill") +
+      coord_flip() +
+      scale_y_continuous(labels = percent_format()) +
+      scale_fill_manual(values = cluster_colors) +
+      labs(
+        x = "Modstander",
+        y = "Andel af kampe",
+        fill = "Kamptype"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        legend.position = "bottom",
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  output$brondby_table <- renderDT({
+    tbl <- filtered_brondby() %>%
+      mutate(
+        XG = round(XG, 2),
+        AVGDISTANCE = round(AVGDISTANCE, 2)
+      ) %>%
+      select(
+        Modstander = opponent_name,
+        Resultat = result,
+        Kamptype = cluster_name,
+        Point = points,
+        xG = XG,
+        Skud = SHOTS,
+        `Skud på mål` = SHOTSONTARGET,
+        Mål = GOALS,
+        `Berøringer i feltet` = TOUCHESINBOX,
+        Driblinger = DRIBBLES,
+        `Progressive løb` = PROGRESSIVERUNS,
+        `Gns. afslutningsafstand` = AVGDISTANCE
+      ) %>%
+      arrange(desc(Point), desc(xG))
+    
+    datatable(
+      tbl,
+      rownames = FALSE,
+      filter = "top",
+      options = list(
+        pageLength = 10,
+        autoWidth = TRUE,
+        scrollX = TRUE
+      )
+    )
+  })
+  
+  output$league_scatter <- renderPlotly({
+    req(nrow(league_data()) > 0)
+    req(input$xvar != input$yvar)
+    
+    plot_ly(
+      data = league_data(),
+      x = as.formula(paste0("~", input$xvar)),
+      y = as.formula(paste0("~", input$yvar)),
+      color = ~cluster_name,
+      colors = cluster_colors,
+      type = "scatter",
+      mode = "markers",
+      marker = list(size = 11, opacity = 0.80),
+      text = ~paste0(
+        "<b>", TEAMNAME, "</b>",
+        "<br>Modstander: ", opponent_name,
+        "<br>Resultat: ", result,
+        "<br>Kamptype: ", cluster_name,
+        "<br>Point: ", points,
+        "<br>xG: ", round(XG, 2),
+        "<br>Skud: ", SHOTS,
+        "<br>Skud på mål: ", SHOTSONTARGET,
+        "<br>Mål: ", GOALS,
+        "<br>Berøringer i feltet: ", TOUCHESINBOX
+      ),
+      hoverinfo = "text"
+    ) %>%
+      layout(
+        title = list(text = "<b>Kampprofiler på tværs af ligaen</b>"),
+        xaxis = list(title = pretty_var(input$xvar)),
+        yaxis = list(title = pretty_var(input$yvar)),
+        legend = list(orientation = "h", x = 0.05, y = -0.15),
+        plot_bgcolor = "white",
+        paper_bgcolor = "white"
+      )
+  })
+  
+  output$league_table <- renderDT({
+    tbl <- league_data() %>%
+      mutate(
+        XG = round(XG, 2),
+        AVGDISTANCE = round(AVGDISTANCE, 2)
+      ) %>%
+      select(
+        Hold = TEAMNAME,
+        Modstander = opponent_name,
+        Resultat = result,
+        Kamptype = cluster_name,
+        Point = points,
+        xG = XG,
+        Skud = SHOTS,
+        `Skud på mål` = SHOTSONTARGET,
+        Mål = GOALS,
+        `Berøringer i feltet` = TOUCHESINBOX,
+        Driblinger = DRIBBLES,
+        `Progressive løb` = PROGRESSIVERUNS,
+        `Gns. afslutningsafstand` = AVGDISTANCE
+      ) %>%
+      arrange(Hold, desc(Point), desc(xG))
+    
+    datatable(
+      tbl,
+      rownames = FALSE,
+      filter = "top",
+      options = list(
+        pageLength = 12,
+        autoWidth = TRUE,
+        scrollX = TRUE
+      )
+    )
+  })
+  
+  output$elbow <- renderPlot({
+    ggplot(elbow_df, aes(k, wss)) +
+      geom_line(linewidth = 1.1, color = brondby_blue) +
+      geom_point(size = 3.5, color = brondby_yellow) +
+      geom_vline(xintercept = 2, linetype = "dashed", color = "grey40") +
+      labs(
+        title = "Elbow plot for valg af antal clusters",
+        subtitle = "Kurven peger på 2 meningsfulde kamptyper",
+        x = "Antal clusters",
+        y = "WSS"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(color = muted_text),
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  output$cluster_summary_table <- renderDT({
+    tbl <- kamp_data %>%
+      group_by(cluster_name) %>%
+      summarise(
+        `Antal kampe` = n(),
+        `Gns. skud` = round(mean(SHOTS, na.rm = TRUE), 2),
+        `Gns. xG` = round(mean(XG, na.rm = TRUE), 2),
+        `Gns. mål` = round(mean(GOALS, na.rm = TRUE), 2),
+        `Gns. skud på mål` = round(mean(SHOTSONTARGET, na.rm = TRUE), 2),
+        `Gns. driblinger` = round(mean(DRIBBLES, na.rm = TRUE), 2),
+        `Gns. berøringer i feltet` = round(mean(TOUCHESINBOX, na.rm = TRUE), 2),
+        `Gns. frispark` = round(mean(FOULS, na.rm = TRUE), 2),
+        `Gns. afslutningsafstand` = round(mean(AVGDISTANCE, na.rm = TRUE), 2),
+        .groups = "drop"
+      )
+    
+    datatable(
+      tbl,
+      rownames = FALSE,
+      options = list(
+        pageLength = 5,
+        autoWidth = TRUE,
+        scrollX = TRUE,
+        dom = "t"
+      )
+    )
+  })
+}
+
+shinyApp(ui, server)

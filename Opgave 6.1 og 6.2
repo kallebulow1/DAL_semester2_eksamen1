@@ -1,0 +1,214 @@
+library(jsonlite)
+library(dplyr)
+library(ggsoccer)
+library(ggplot2)
+library(stringr)
+source("util.R")
+
+###### - opgave 6.1 - ######
+
+# hent alle kampe med util.R fra statsbomb
+allMatches=getAllMatches()
+colnames(allMatches)
+# filtrer kun på kvindernes kampe for EM 2023
+em2023F=allMatches %>% filter(competition.competition_id==53)
+
+# Ekstraherer match IDs fra kvindernes EM 2023
+em2023FMIDS=em2023F$match_id
+
+# Henter eventdata for alle disse kampe
+em2023FEvents <- getAllEventsMultipleMatches(em2023FMIDS)
+
+# Henter eventdata for alle disse kampe
+em2023FShots <- em2023FEvents
+
+# Filtrerer alle skud fra eventdata
+em2023FShots=em2023FEvents %>% filter(type.name=="Shot")
+
+# (Kommentar) Her fokuseres på skud
+# Loader variabel/kolonne-definition fra RDS-fil
+shotv=readRDS("shotvector.rds")
+
+# Udvælger relevante kolonner til analyse
+em2023FShotsSub=em2023FShots %>% select(shotv)
+
+# Ekstraherer x-koordinat for hvor skuddet ender
+em2023FShotsSub$endx=unlist(lapply(em2023FShotsSub$shot.end_location, function(x) x[1]))
+
+# Ekstraherer y-koordinat for hvor skuddet ender
+em2023FShotsSub$endy=unlist(lapply(em2023FShotsSub$shot.end_location, function(x) x[2]))
+
+# Ekstraherer x-koordinat for hvor skuddet tages fra
+em2023FShotsSub$shx=unlist(lapply(em2023FShotsSub$location, function(x) x[1]))
+
+# Ekstraherer y-koordinat for hvor skuddet tages fra
+em2023FShotsSub$shy=unlist(lapply(em2023FShotsSub$location, function(x) x[2]))
+
+
+
+# filtrer på mål og top 10 af hvem der har scoret flest mål
+goalrank <- em2023FShotsSub %>%
+  filter(shot.outcome.name == "Goal") %>%   # kun mål
+  group_by(player.name) %>%                 # grupér efter spiller
+  summarise(goals = n()) %>%                # tæl antal mål
+  arrange(desc(goals)) %>%                  # sortér faldende
+  slice_head(n = 10)                        # top 10
+
+# plot resultatet af top målscorer
+ggplot(goalrank, aes(x = reorder(player.name, goals), y = goals)) +
+  geom_col(fill = "#2E8B57") +
+  coord_flip() +
+  labs(title = "Top 10 målscorere EM 2022 (kvinder)",
+       x = "Spiller",
+       y = "Antal mål")
+
+# beregne skudafstand til mål for alle Bethany Meads skud
+em2023FShotsSub <- em2023FShotsSub %>%
+  mutate(distance = sqrt((120 - shx)^2 + (40 - shy)^2))
+
+
+# beregn vinkel til mål på hendes skud
+angle_to_goal <- function(x, y) {
+  # mål stolper
+  goal_left  <- c(120, 36)
+  goal_right <- c(120, 44)
+  
+  # vektorer fra skud til stolper
+  v1 <- c(goal_left[1] - x, goal_left[2] - y)
+  v2 <- c(goal_right[1] - x, goal_right[2] - y)
+  
+  # dot product
+  dot <- sum(v1 * v2)
+  
+  # længder
+  len1 <- sqrt(sum(v1^2))
+  len2 <- sqrt(sum(v2^2))
+  
+  # vinkel i radianer
+  angle <- acos(dot / (len1 * len2))
+  
+  return(angle)
+}
+
+# tilføj kolonne med vinkel (radianer) til min dataframe
+em2023FShotsSub <- em2023FShotsSub %>%
+  rowwise() %>%
+  mutate(angle = angle_to_goal(shx, shy)) %>%
+  ungroup()
+
+# Gør det til normale vinkler
+em2023FShotsSub <- em2023FShotsSub %>%
+  mutate(angle_deg = angle * 180 / pi)
+
+# gør distance til meter istedet for statsbomb enheder
+em2023FShotsSub <- em2023FShotsSub %>%
+  mutate(distance_m = distance * 0.87)
+
+# gennemsnitlige vinkel og afstand for bethany meads skud
+bethany_mean <- em2023FShotsSub %>%  
+  filter(player.name == "Bethany Mead") %>%  
+  summarise(
+    avg_angle = mean(angle_deg, na.rm = TRUE),
+    avg_distance = mean(distance_m, na.rm = TRUE)
+  )
+
+
+
+
+
+# plotte et gennemsnitlig skud for Bethany Mead
+# Beregn gennemsnit for Bethany Mead
+bethany_avg <- em2023FShotsSub %>%
+  filter(player.name == "Bethany Mead") %>%
+  summarise(
+    avg_shx = mean(shx, na.rm = TRUE),
+    avg_shy = mean(shy, na.rm = TRUE),
+    avg_angle = mean(angle_deg, na.rm = TRUE),
+    avg_distance = mean(distance_m, na.rm = TRUE)
+  )
+
+# Trekant (skudvinkel)
+triangle_df <- data.frame(
+  x = c(bethany_avg$avg_shx, 120, 120),
+  y = c(bethany_avg$avg_shy, 36, 44),
+ggplot() +
+  annotate_pitch(
+    dimensions = pitch_statsbomb,
+    colour = "white",
+    fill = "#2E8B57"
+  ) +
+  geom_polygon(
+    data = triangle_df,
+    aes(x = x, y = y),
+    fill = "#F4D35E",
+    alpha = 0.18,
+    colour = NA
+  ) +
+  geom_point(
+    data = bethany_avg,
+    aes(x = avg_shx, y = avg_shy),
+    shape = 21,
+    fill = "white",
+    color = "black",
+    size = 4,
+    stroke = 1
+  ) +
+  coord_flip(xlim = c(80, 121)) +
+  scale_y_reverse() +
+  theme_pitch() +
+  labs(
+    title = "Bethany Mead tager afslutninger fra gunstige positioner",
+    subtitle = "Bethany Meads gennemsnitlige skudposition og vinkel mod målet (EM 2022)",
+  ) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    plot.caption = element_text(size = 9, colour = "grey30", hjust = 1),
+    plot.background = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA)
+  )
+)
+
+
+
+
+###### - opgave 6.2 - ######
+# Data (du kan ændre labels hvis du vil)
+df <- data.frame(
+  kategori = c("Direkte observerbar", 
+               "Aktører", 
+               "Kontekst", 
+               "Metadata"),
+  score = c(4, 3, 2, 1)
+)
+
+# Plot
+ggplot(df, aes(x = score, y = 1)) +
+  geom_point(size = 5) +
+  geom_text(aes(label = kategori), vjust = -1.2, size = 4) +
+  
+  # Akse labels
+  scale_x_continuous(
+    breaks = c(1, 2, 3, 4),
+    labels = c("Langt fra virkeligheden", "", "", "Tæt på virkeligheden")
+  ) +
+  
+  # Fjern y-akse (ikke relevant)
+  scale_y_continuous(NULL, breaks = NULL) +
+  
+  labs(
+    title = "Prioritering af features ud fra logisk positivisme",
+    subtitle = "Fra abstrakte metadata til direkte observerbare data",
+    x = NULL,
+    y = NULL
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+

@@ -1,0 +1,1010 @@
+# ---- Opgave 3.1 ----
+
+# ---- Pakker ----
+library(DBI)
+library(RMariaDB)
+library(dplyr)
+library(plotly)
+library(shiny)
+library(scales)
+library(tidyr)
+library(DT)
+library(bslib)
+library(ggplot2)
+
+# Der ikke forbindelse til SQL server så df_pass bliver læst ind som RDS
+# Det samme med kamp_data. Så ikke kør connection og query
+df_pass <- readRDS("df_pass.rds")
+
+# ---- Connection ----
+con3 <- dbConnect(
+  RMariaDB::MariaDB(),
+  host = "www.talmedos.com",
+  port = 3306,
+  user = "dalremote",
+  password = "OttoRehagel123456789Long2026!",
+  dbname = "superliga2"
+)
+
+# ---- Hent afleveringsdata ----
+df_pass <- dbGetQuery(con_superliga2, "
+SELECT
+  p.MATCH_WYID,
+  p.EVENT_WYID,
+  p.ACCURATE,
+  p.ANGLE,
+  p.HEIGHT,
+  p.LENGTH,
+  p.RECIPIENT_WYID,
+  p.ENDLOCATIONX,
+  p.ENDLOCATIONY,
+
+  c.SEASON_WYID,
+  c.MINUTE,
+  c.SECOND,
+  c.MATCHPERIOD,
+  c.PRIMARYTYPE,
+  c.LOCATIONX,
+  c.LOCATIONY,
+  c.PLAYER_WYID,
+  c.TEAM_WYID,
+
+  pl.SHORTNAME,
+  pl.ROLENAME,
+  t.TEAMNAME
+
+FROM wyscout_matchevents_passes p
+JOIN wyscout_matchevents_common c
+  ON p.MATCH_WYID = c.MATCH_WYID
+ AND p.EVENT_WYID = c.EVENT_WYID
+JOIN wyscout_players pl
+  ON c.PLAYER_WYID = pl.PLAYER_WYID
+LEFT JOIN wyscout_teams t
+  ON c.TEAM_WYID = t.TEAM_WYID
+JOIN wyscout_matches m
+  ON p.MATCH_WYID = m.MATCH_WYID
+WHERE m.SEASON_WYID IN (189918, 191611)
+")
+
+# ---- Fjern dubletter ----
+df_pass <- df_pass %>%
+  distinct(MATCH_WYID, EVENT_WYID, .keep_all = TRUE)
+table(df_pass$PRIMARYTYPE)
+
+
+# ---- Behold kun afleveringer ----
+passes_forrige <- df_pass %>%
+  filter(SEASON_WYID == 189918, PRIMARYTYPE == "pass")
+
+passes_indevaerende <- df_pass %>%
+  filter(SEASON_WYID == 191611, PRIMARYTYPE == "pass")
+
+
+
+# ---- Filtrer afleveringer i forrige sæson ----
+# Koden gennemgår alle kampe og alle hold i hver kamp og filtrerer afleveringerne, 
+# så kun de afleveringer, hvor modtageren er en medspiller fra samme hold, bliver beholdt. 
+# Resultatet er et samlet datasæt med afleveringer, der med stor sandsynlighed er succesfulde.
+
+#Opret tomt dataframe til filtrerede afleveringer
+filtered_df_forrige <- data.frame()
+
+#Loop gennem alle kampe
+for (j in 1:length(unique(passes_forrige$MATCH_WYID))) {
+  
+  #Udvælg én kamp
+  match1 <- passes_forrige %>%
+    filter(MATCH_WYID == unique(passes_forrige$MATCH_WYID)[j])
+  
+  #Find hold i kampen
+  teamz <- unique(match1$TEAM_WYID)
+  
+  #Loop gennem hvert hold
+  for (i in 1:length(teamz)) {
+    
+    #Filtrer afleveringer for ét hold
+    filtered_df2 <- match1 %>%
+      filter(TEAM_WYID == teamz[i])
+    
+    #Behold afleveringer til medspillere
+    filtered_df1 <- filtered_df2 %>%
+      filter(RECIPIENT_WYID %in% unique(filtered_df2$PLAYER_WYID))
+    
+    #Tilføj til samlet datasæt
+    filtered_df_forrige <- rbind(filtered_df_forrige, filtered_df1)
+  }
+}
+
+# ---- Filtrer afleveringer i indeværende sæson ----
+# Opret tomt dataframe til filtrerede afleveringer
+filtered_df_indevaerende <- data.frame()
+
+# Loop gennem alle kampe
+for (j in 1:length(unique(passes_indevaerende$MATCH_WYID))) {
+  
+  # Udvælg én kamp
+  match1 <- passes_indevaerende %>%
+    filter(MATCH_WYID == unique(passes_indevaerende$MATCH_WYID)[j])
+  
+  # Find hold i kampen
+  teamz <- unique(match1$TEAM_WYID)
+  
+  # Loop gennem hvert hold
+  for (i in 1:length(teamz)) {
+    
+    # Filtrer afleveringer for ét hold
+    filtered_df2 <- match1 %>%
+      filter(TEAM_WYID == teamz[i])
+    
+    # Behold afleveringer til medspillere
+    filtered_df1 <- filtered_df2 %>%
+      filter(RECIPIENT_WYID %in% unique(filtered_df2$PLAYER_WYID))
+    
+    # Tilføj til samlet datasæt
+    filtered_df_indevaerende <- rbind(filtered_df_indevaerende, filtered_df1)
+  }
+}
+
+# ---- Saml begge sæsoner ----
+filtered_df <- bind_rows(filtered_df_forrige, filtered_df_indevaerende)
+
+# ---- Alle afleveringer pr. spiller ----
+all_passes_player <- df_pass %>%
+  filter(PRIMARYTYPE == "pass") %>%
+  group_by(SEASON_WYID, TEAM_WYID, TEAMNAME, PLAYER_WYID, SHORTNAME, ROLENAME) %>%
+  summarise(
+    total_passes = n(),
+    avg_length = mean(LENGTH, na.rm = TRUE),
+    long_pass_rate = mean(LENGTH > 30, na.rm = TRUE),
+    forward_pass_rate = mean(ENDLOCATIONX > LOCATIONX, na.rm = TRUE),
+    avg_angle = mean(abs(ANGLE), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- Korrekte afleveringer pr. spiller ----
+accurate_passes_player <- filtered_df %>%
+  group_by(SEASON_WYID, TEAM_WYID, TEAMNAME, PLAYER_WYID, SHORTNAME, ROLENAME) %>%
+  summarise(
+    accurate_passes = n(),
+    .groups = "drop"
+  )
+
+# ---- Saml og lav accuracy ----
+player_pass <- all_passes_player %>%
+  left_join(
+    accurate_passes_player,
+    by = c("SEASON_WYID", "TEAM_WYID", "TEAMNAME", "PLAYER_WYID", "SHORTNAME", "ROLENAME")
+  ) %>%
+  mutate(
+    accurate_passes = ifelse(is.na(accurate_passes), 0, accurate_passes),
+    accuracy = accurate_passes / total_passes
+  ) %>%
+  filter(total_passes >= 30)
+
+# ---- Vælg variable til clustering ----
+cluster_data <- player_pass %>%
+  select(
+    accuracy,
+    avg_length,
+    long_pass_rate,
+    forward_pass_rate,
+    avg_angle
+  )
+
+# ---- Standardiser data ----
+cluster_scaled <- scale(cluster_data)
+
+# ---- Elbow plot ----
+wss <- numeric(10)
+
+set.seed(123)
+for (i in 1:10) {
+  wss[i] <- kmeans(cluster_scaled, centers = i, nstart = 20)$tot.withinss
+}
+
+elbow_df <- data.frame(
+  k = 1:10,
+  wss = wss
+)
+
+# plotte elbow 
+ggplot(elbow_df, aes(x = k, y = wss)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 3, linetype = "dashed", linewidth = 0.5) +
+  scale_x_continuous(
+    breaks = 1:10,
+    limits = c(1, 10)
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 3000, by = 500),
+    labels = label_number(big.mark = ".", decimal.mark = ",")
+  ) +
+  labs(
+    title = "Elbow plot for valg af antal cluster",
+    subtitle = "Et tydeligt knæk ses ved c = 3",
+    x = "Antal cluster (c)",
+    y = "WSS"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, margin = margin(b = 8)),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 10)
+  )
+
+# ---- K-means model ----
+set.seed(123)
+k_model <- kmeans(cluster_scaled, centers = 3, nstart = 30)
+
+# ---- Sæt cluster på spillerdata ----
+player_pass$cluster <- as.factor(k_model$cluster)
+
+# ---- Giv clusters navne ----
+cluster_labels <- c(
+  "1" = "Direkte afleverere",
+  "2" = "Korte og sikre afleverere",
+  "3" = "Længere og mere risikovillige afleverere"
+)
+
+player_pass <- player_pass %>%
+  mutate(cluster_name = recode(cluster, !!!cluster_labels))
+
+# ---- Cluster summary ----
+cluster_summary <- player_pass %>%
+  group_by(cluster, cluster_name) %>%
+  summarise(
+    antal_spillere = n(),
+    total_passes = round(mean(total_passes, na.rm = TRUE), 1),
+    accurate_passes = round(mean(accurate_passes, na.rm = TRUE), 1),
+    accuracy = round(mean(accuracy, na.rm = TRUE), 3),
+    avg_length = round(mean(avg_length, na.rm = TRUE), 1),
+    long_pass_rate = round(mean(long_pass_rate, na.rm = TRUE), 3),
+    forward_pass_rate = round(mean(forward_pass_rate, na.rm = TRUE), 3),
+    avg_angle = round(mean(avg_angle, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+# ---- Lav scatterplot ---- 
+ggplot(player_pass, aes(x = accuracy, y = avg_length, color = cluster_name)) +
+  
+  # Punkter (spillere)
+  geom_point(size = 3, alpha = 0.8) +
+  
+  # Labels (valgfri – kan fjernes hvis for crowded)
+  # geom_text(aes(label = SHORTNAME), size = 3, vjust = -1)
+  
+  # Farver
+  scale_color_manual(values = c(
+    "Korte og sikre afleverere" = "#1f77b4",
+    "Direkte afleverere" = "#2ca02c",
+    "Længere og mere risikovillige afleverere" = "#d62728"
+  )) +
+  
+  # Titler
+  labs(
+    title = "Afleveringsprofiler blandt spillere",
+    subtitle = "Sammenhæng mellem afleveringspræcision og gennemsnitlig længde",
+    x = "Afleveringspræcision",
+    y = "Gns. afleveringslængde",
+    color = "Cluster"
+  ) +
+  
+  # Tema (gør det pænt til opgave)
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+
+
+
+
+# ---- Shiny UI ----
+# ---- Brøndby data ----
+brondby_data <- player_pass %>%
+  filter(grepl("Brøndby", TEAMNAME, ignore.case = TRUE))
+
+# ---- Farver ----
+brondby_blue <- "#003DA5"
+brondby_yellow <- "#FFD100"
+light_bg <- "#F7F8FC"
+card_bg <- "#FFFFFF"
+text_dark <- "#1F2937"
+muted_text <- "#6B7280"
+soft_yellow <- "#FFF4B8"
+
+cluster_colors <- c(
+  "Direkte afleverere" = "#003DA5",
+  "Korte og sikre afleverere" = "#FFD100",
+  "Længere og mere risikovillige afleverere" = "#7A8799"
+)
+
+# ---- Labels ----
+pretty_var <- function(x) {
+  dplyr::case_when(
+    x == "accuracy" ~ "Afleveringspræcision",
+    x == "avg_length" ~ "Gns. afleveringslængde",
+    x == "long_pass_rate" ~ "Andel lange afleveringer",
+    x == "forward_pass_rate" ~ "Andel fremadrettede afleveringer",
+    x == "avg_angle" ~ "Gns. vinkel",
+    x == "total_passes" ~ "Antal afleveringer",
+    TRUE ~ x
+  )
+}
+
+# ---- UI ----
+ui <- fluidPage(
+  theme = bs_theme(
+    version = 5,
+    primary = brondby_blue,
+    secondary = brondby_yellow,
+    bg = light_bg,
+    fg = text_dark,
+    base_font = font_google("Inter")
+  ),
+  
+  tags$head(
+    tags$style(HTML(paste0("
+      body {
+        background-color: ", light_bg, ";
+      }
+
+      .top-banner {
+        background: linear-gradient(90deg, ", brondby_blue, " 0%, ", brondby_yellow, " 100%);
+        color: white;
+        border-radius: 18px;
+        padding: 26px 30px;
+        margin-bottom: 20px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.10);
+      }
+
+      .top-banner h1 {
+        margin: 0;
+        font-size: 30px;
+        font-weight: 800;
+      }
+
+      .top-banner p {
+        margin: 8px 0 0 0;
+        font-size: 15px;
+        opacity: 0.95;
+      }
+
+      .sidebar-panel, .content-card, .kpi-card {
+        background: ", card_bg, ";
+        border-radius: 16px;
+        box-shadow: 0 8px 22px rgba(0,0,0,0.06);
+        border: none;
+      }
+
+      .sidebar-panel {
+        padding: 18px;
+      }
+
+      .content-card {
+        padding: 18px;
+        margin-bottom: 18px;
+      }
+
+      .kpi-card {
+        padding: 18px 20px;
+        min-height: 125px;
+        margin-bottom: 16px;
+        border-left: 8px solid ", brondby_yellow, ";
+        background: linear-gradient(180deg, #FFFFFF 0%, ", soft_yellow, " 100%);
+      }
+
+      .kpi-title {
+        font-size: 13px;
+        font-weight: 700;
+        color: ", muted_text, ";
+        margin-bottom: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .kpi-value {
+        font-size: 30px;
+        font-weight: 800;
+        color: ", brondby_blue, ";
+        line-height: 1.1;
+      }
+
+      .kpi-sub {
+        margin-top: 8px;
+        font-size: 13px;
+        color: ", muted_text, ";
+      }
+
+      .section-title {
+        font-size: 18px;
+        font-weight: 800;
+        color: ", brondby_blue, ";
+        margin-bottom: 12px;
+      }
+
+      .nav-tabs .nav-link {
+        border: none !important;
+        color: ", text_dark, ";
+        font-weight: 700;
+        margin-right: 8px;
+        border-radius: 10px !important;
+        background-color: #F3F4F6;
+      }
+
+      .nav-tabs .nav-link.active {
+        background-color: ", brondby_yellow, " !important;
+        color: ", brondby_blue, " !important;
+      }
+
+      .control-label {
+        font-weight: 700;
+        color: ", text_dark, ";
+      }
+
+      .irs-bar, .irs-single, .irs-from, .irs-to {
+        background: ", brondby_yellow, ";
+        border-color: ", brondby_yellow, ";
+        color: ", brondby_blue, ";
+      }
+
+      .irs-handle {
+        border-color: ", brondby_blue, ";
+      }
+
+      .selectize-input {
+        border-radius: 10px !important;
+      }
+    ")))
+  ),
+  
+  div(
+    class = "top-banner",
+    h1("Brøndby IF – Afleveringsdashboard"),
+    p("Interaktiv analyse af Brøndbys afleveringsprofiler og scouting i resten af ligaen")
+  ),
+  
+  fluidRow(
+    column(
+      width = 3,
+      div(
+        class = "sidebar-panel",
+        h4(class = "section-title", "Fælles filtre"),
+        
+        selectInput(
+          "season_filter",
+          "Sæson",
+          choices = sort(unique(player_pass$SEASON_WYID)),
+          selected = max(player_pass$SEASON_WYID, na.rm = TRUE)
+        ),
+        
+        sliderInput(
+          "min_passes",
+          "Minimum afleveringer",
+          min = 30,
+          max = max(player_pass$total_passes, na.rm = TRUE),
+          value = 50,
+          step = 10
+        ),
+        
+        selectInput(
+          "xvar",
+          "X-akse",
+          choices = c(
+            "Afleveringspræcision" = "accuracy",
+            "Gns. afleveringslængde" = "avg_length",
+            "Andel lange afleveringer" = "long_pass_rate",
+            "Andel fremadrettede afleveringer" = "forward_pass_rate",
+            "Gns. vinkel" = "avg_angle",
+            "Antal afleveringer" = "total_passes"
+          ),
+          selected = "accuracy"
+        ),
+        
+        selectInput(
+          "yvar",
+          "Y-akse",
+          choices = c(
+            "Gns. afleveringslængde" = "avg_length",
+            "Afleveringspræcision" = "accuracy",
+            "Andel lange afleveringer" = "long_pass_rate",
+            "Andel fremadrettede afleveringer" = "forward_pass_rate",
+            "Gns. vinkel" = "avg_angle",
+            "Antal afleveringer" = "total_passes"
+          ),
+          selected = "avg_length"
+        )
+      )
+    ),
+    
+    column(
+      width = 9,
+      
+      tabsetPanel(
+        tabPanel(
+          "Brøndby",
+          br(),
+          
+          fluidRow(
+            column(3, uiOutput("kpi_players")),
+            column(3, uiOutput("kpi_accuracy")),
+            column(3, uiOutput("kpi_length")),
+            column(3, uiOutput("kpi_forward"))
+          ),
+          
+          fluidRow(
+            column(
+              12,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Brøndby-spillere i afleveringsrummet"),
+                selectInput(
+                  "brondby_role_filter",
+                  "Filtrer på position",
+                  choices = c("Alle", sort(unique(brondby_data$ROLENAME))),
+                  selected = "Alle"
+                ),
+                plotlyOutput("brondby_scatter", height = "520px")
+              )
+            )
+          ),
+          
+          fluidRow(
+            column(
+              6,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Clusterfordeling i Brøndby"),
+                plotOutput("cluster_bar", height = "280px")
+              )
+            ),
+            column(
+              6,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Brøndby vs. ligaen"),
+                plotOutput("compare_plot", height = "280px")
+              )
+            )
+          ),
+          
+          div(
+            class = "content-card",
+            h4(class = "section-title", "Brøndbys spilleroversigt"),
+            DTOutput("brondby_table")
+          )
+        ),
+        
+        tabPanel(
+          "Liga / scouting",
+          br(),
+          
+          div(
+            class = "content-card",
+            h4(class = "section-title", "Scoutingværktøj"),
+            
+            fluidRow(
+              column(
+                4,
+                selectInput(
+                  "scout_team_filter",
+                  "Vælg hold",
+                  choices = c("Alle", sort(unique(player_pass$TEAMNAME))),
+                  selected = "Alle"
+                )
+              ),
+              column(
+                4,
+                selectInput(
+                  "scout_role_filter",
+                  "Vælg position",
+                  choices = c("Alle", sort(unique(player_pass$ROLENAME))),
+                  selected = "Alle"
+                )
+              ),
+              column(
+                4,
+                selectizeInput(
+                  "scout_player_filter",
+                  "Vælg spiller(e)",
+                  choices = NULL,
+                  selected = NULL,
+                  multiple = TRUE
+                )
+              )
+            ),
+            
+            plotlyOutput("scout_scatter", height = "520px")
+          ),
+          
+          fluidRow(
+            column(
+              12,
+              div(
+                class = "content-card",
+                h4(class = "section-title", "Ligaoversigt over spillere"),
+                DTOutput("scout_table")
+              )
+            )
+          )
+        ),
+        
+        tabPanel(
+          "Model",
+          br(),
+          div(
+            class = "content-card",
+            h4(class = "section-title", "Valg af antal clusters"),
+            plotOutput("elbow", height = "420px")
+          )
+        )
+      )
+    )
+  )
+)
+
+# ---- SERVER ----
+server <- function(input, output, session) {
+  
+  filtered_brondby <- reactive({
+    data <- brondby_data %>%
+      filter(
+        SEASON_WYID == input$season_filter,
+        total_passes >= input$min_passes
+      )
+    
+    if (input$brondby_role_filter != "Alle") {
+      data <- data %>% filter(ROLENAME == input$brondby_role_filter)
+    }
+    
+    data
+  })
+  
+  league_data <- reactive({
+    player_pass %>%
+      filter(
+        SEASON_WYID == input$season_filter,
+        total_passes >= input$min_passes
+      )
+  })
+  
+  scout_data <- reactive({
+    data <- player_pass %>%
+      filter(
+        SEASON_WYID == input$season_filter,
+        total_passes >= input$min_passes
+      )
+    
+    if (input$scout_team_filter != "Alle") {
+      data <- data %>% filter(TEAMNAME == input$scout_team_filter)
+    }
+    
+    if (input$scout_role_filter != "Alle") {
+      data <- data %>% filter(ROLENAME == input$scout_role_filter)
+    }
+    
+    if (!is.null(input$scout_player_filter) && length(input$scout_player_filter) > 0) {
+      data <- data %>% filter(SHORTNAME %in% input$scout_player_filter)
+    }
+    
+    data
+  })
+  
+  observe({
+    available_players <- player_pass %>%
+      filter(
+        SEASON_WYID == input$season_filter,
+        total_passes >= input$min_passes
+      )
+    
+    if (input$scout_team_filter != "Alle") {
+      available_players <- available_players %>%
+        filter(TEAMNAME == input$scout_team_filter)
+    }
+    
+    if (input$scout_role_filter != "Alle") {
+      available_players <- available_players %>%
+        filter(ROLENAME == input$scout_role_filter)
+    }
+    
+    updateSelectizeInput(
+      session,
+      "scout_player_filter",
+      choices = sort(unique(available_players$SHORTNAME)),
+      server = TRUE
+    )
+  })
+  
+  # KPI
+  output$kpi_players <- renderUI({
+    div(
+      class = "kpi-card",
+      div(class = "kpi-title", "Spillere i visningen"),
+      div(class = "kpi-value", nrow(filtered_brondby())),
+      div(class = "kpi-sub", "Antal Brøndby-spillere efter filter")
+    )
+  })
+  
+  output$kpi_accuracy <- renderUI({
+    val <- mean(filtered_brondby()$accuracy, na.rm = TRUE)
+    div(
+      class = "kpi-card",
+      div(class = "kpi-title", "Gns. præcision"),
+      div(class = "kpi-value", percent(val, accuracy = 0.1)),
+      div(class = "kpi-sub", "Brøndbys afleveringspræcision")
+    )
+  })
+  
+  output$kpi_length <- renderUI({
+    val <- mean(filtered_brondby()$avg_length, na.rm = TRUE)
+    div(
+      class = "kpi-card",
+      div(class = "kpi-title", "Gns. længde"),
+      div(class = "kpi-value", round(val, 1)),
+      div(class = "kpi-sub", "Gennemsnitlig afleveringslængde")
+    )
+  })
+  
+  output$kpi_forward <- renderUI({
+    val <- mean(filtered_brondby()$forward_pass_rate, na.rm = TRUE)
+    div(
+      class = "kpi-card",
+      div(class = "kpi-title", "Fremadrettede afleveringer"),
+      div(class = "kpi-value", percent(val, accuracy = 0.1)),
+      div(class = "kpi-sub", "Andel afleveringer spillet fremad")
+    )
+  })
+  
+  # Brøndby scatter
+  output$brondby_scatter <- renderPlotly({
+    req(nrow(filtered_brondby()) > 0)
+    req(input$xvar != input$yvar)
+    
+    plot_ly(
+      data = filtered_brondby(),
+      x = as.formula(paste0("~", input$xvar)),
+      y = as.formula(paste0("~", input$yvar)),
+      color = ~cluster_name,
+      colors = cluster_colors,
+      type = "scatter",
+      mode = "markers",
+      marker = list(size = 12, opacity = 0.85),
+      text = ~paste0(
+        "<b>", SHORTNAME, "</b>",
+        "<br>Hold: ", TEAMNAME,
+        "<br>Position: ", ROLENAME,
+        "<br>Cluster: ", cluster_name,
+        "<br>Antal afleveringer: ", total_passes,
+        "<br>Præcision: ", percent(accuracy, accuracy = 0.1),
+        "<br>Gns. længde: ", round(avg_length, 1),
+        "<br>Lange afleveringer: ", percent(long_pass_rate, accuracy = 0.1),
+        "<br>Fremadrettede afleveringer: ", percent(forward_pass_rate, accuracy = 0.1),
+        "<br>Gns. vinkel: ", round(avg_angle, 1)
+      ),
+      hoverinfo = "text"
+    ) %>%
+      layout(
+        title = list(text = "<b>Afleveringsprofiler blandt Brøndby-spillere</b>"),
+        xaxis = list(title = pretty_var(input$xvar)),
+        yaxis = list(title = pretty_var(input$yvar)),
+        legend = list(orientation = "h", x = 0.05, y = -0.15),
+        plot_bgcolor = "white",
+        paper_bgcolor = "white"
+      )
+  })
+  
+  # Cluster bar
+  output$cluster_bar <- renderPlot({
+    all_clusters <- data.frame(
+      cluster_name = c(
+        "Direkte afleverere",
+        "Korte og sikre afleverere",
+        "Længere og mere risikovillige afleverere"
+      )
+    )
+    
+    cluster_df <- filtered_brondby() %>%
+      count(cluster_name) %>%
+      right_join(all_clusters, by = "cluster_name") %>%
+      mutate(n = ifelse(is.na(n), 0, n))
+    
+    ggplot(cluster_df, aes(x = cluster_name, y = n, fill = cluster_name)) +
+      geom_col(width = 0.7) +
+      scale_fill_manual(values = cluster_colors) +
+      labs(
+        x = NULL,
+        y = "Antal spillere"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 15, hjust = 1, face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  # Compare
+  output$compare_plot <- renderPlot({
+    br <- filtered_brondby() %>%
+      summarise(
+        accuracy = mean(accuracy, na.rm = TRUE),
+        avg_length = mean(avg_length, na.rm = TRUE),
+        forward_pass_rate = mean(forward_pass_rate, na.rm = TRUE)
+      ) %>%
+      mutate(type = "Brøndby")
+    
+    lg <- league_data() %>%
+      summarise(
+        accuracy = mean(accuracy, na.rm = TRUE),
+        avg_length = mean(avg_length, na.rm = TRUE),
+        forward_pass_rate = mean(forward_pass_rate, na.rm = TRUE)
+      ) %>%
+      mutate(type = "Liga")
+    
+    compare_df <- bind_rows(br, lg) %>%
+      pivot_longer(
+        cols = c(accuracy, avg_length, forward_pass_rate),
+        names_to = "metric",
+        values_to = "value"
+      ) %>%
+      mutate(
+        metric = recode(
+          metric,
+          "accuracy" = "Præcision",
+          "avg_length" = "Længde",
+          "forward_pass_rate" = "Fremad"
+        )
+      )
+    
+    ggplot(compare_df, aes(x = metric, y = value, fill = type)) +
+      geom_col(position = "dodge", width = 0.7) +
+      scale_fill_manual(values = c("Brøndby" = brondby_yellow, "Liga" = "#C7CED9")) +
+      labs(
+        x = NULL,
+        y = NULL,
+        fill = NULL
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        legend.position = "bottom",
+        axis.text.x = element_text(face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  # Brøndby tabel
+  output$brondby_table <- renderDT({
+    tbl <- filtered_brondby() %>%
+      mutate(
+        accuracy = percent(accuracy, accuracy = 0.1),
+        long_pass_rate = percent(long_pass_rate, accuracy = 0.1),
+        forward_pass_rate = percent(forward_pass_rate, accuracy = 0.1),
+        avg_length = round(avg_length, 1),
+        avg_angle = round(avg_angle, 1)
+      ) %>%
+      select(
+        Spiller = SHORTNAME,
+        Position = ROLENAME,
+        Cluster = cluster_name,
+        `Antal afleveringer` = total_passes,
+        `Præcision` = accuracy,
+        `Gns. længde` = avg_length,
+        `Lange afleveringer` = long_pass_rate,
+        `Fremadrettede afleveringer` = forward_pass_rate,
+        `Gns. vinkel` = avg_angle
+      ) %>%
+      arrange(desc(`Antal afleveringer`))
+    
+    datatable(
+      tbl,
+      rownames = FALSE,
+      filter = "top",
+      options = list(
+        pageLength = 10,
+        autoWidth = TRUE,
+        scrollX = TRUE
+      )
+    )
+  })
+  
+  # Scouting scatter
+  output$scout_scatter <- renderPlotly({
+    req(nrow(scout_data()) > 0)
+    req(input$xvar != input$yvar)
+    
+    plot_ly(
+      data = scout_data(),
+      x = as.formula(paste0("~", input$xvar)),
+      y = as.formula(paste0("~", input$yvar)),
+      color = ~cluster_name,
+      colors = cluster_colors,
+      type = "scatter",
+      mode = "markers",
+      marker = list(size = 11, opacity = 0.80),
+      text = ~paste0(
+        "<b>", SHORTNAME, "</b>",
+        "<br>Hold: ", TEAMNAME,
+        "<br>Position: ", ROLENAME,
+        "<br>Cluster: ", cluster_name,
+        "<br>Antal afleveringer: ", total_passes,
+        "<br>Præcision: ", percent(accuracy, accuracy = 0.1),
+        "<br>Gns. længde: ", round(avg_length, 1),
+        "<br>Lange afleveringer: ", percent(long_pass_rate, accuracy = 0.1),
+        "<br>Fremadrettede afleveringer: ", percent(forward_pass_rate, accuracy = 0.1),
+        "<br>Gns. vinkel: ", round(avg_angle, 1)
+      ),
+      hoverinfo = "text"
+    ) %>%
+      layout(
+        title = list(text = "<b>Scouting på tværs af ligaen</b>"),
+        xaxis = list(title = pretty_var(input$xvar)),
+        yaxis = list(title = pretty_var(input$yvar)),
+        legend = list(orientation = "h", x = 0.05, y = -0.15),
+        plot_bgcolor = "white",
+        paper_bgcolor = "white"
+      )
+  })
+  
+  # Scouting tabel
+  output$scout_table <- renderDT({
+    tbl <- scout_data() %>%
+      mutate(
+        accuracy = percent(accuracy, accuracy = 0.1),
+        long_pass_rate = percent(long_pass_rate, accuracy = 0.1),
+        forward_pass_rate = percent(forward_pass_rate, accuracy = 0.1),
+        avg_length = round(avg_length, 1),
+        avg_angle = round(avg_angle, 1)
+      ) %>%
+      select(
+        Hold = TEAMNAME,
+        Spiller = SHORTNAME,
+        Position = ROLENAME,
+        Cluster = cluster_name,
+        `Antal afleveringer` = total_passes,
+        `Præcision` = accuracy,
+        `Gns. længde` = avg_length,
+        `Lange afleveringer` = long_pass_rate,
+        `Fremadrettede afleveringer` = forward_pass_rate,
+        `Gns. vinkel` = avg_angle
+      ) %>%
+      arrange(Hold, desc(`Antal afleveringer`))
+    
+    datatable(
+      tbl,
+      rownames = FALSE,
+      filter = "top",
+      options = list(
+        pageLength = 12,
+        autoWidth = TRUE,
+        scrollX = TRUE
+      )
+    )
+  })
+  
+  # Elbow plot
+  output$elbow <- renderPlot({
+    ggplot(elbow_df, aes(k, wss)) +
+      geom_line(linewidth = 1.1, color = brondby_blue) +
+      geom_point(size = 3.5, color = brondby_yellow) +
+      geom_vline(xintercept = 3, linetype = "dashed", color = "grey40") +
+      labs(
+        title = "Elbow plot for valg af antal clusters",
+        subtitle = "Kurven peger på 3 meningsfulde afleveringsprofiler",
+        x = "Antal clusters",
+        y = "WSS"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(color = muted_text),
+        panel.grid.minor = element_blank()
+      )
+  })
+}
+
+shinyApp(ui, server)

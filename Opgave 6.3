@@ -1,0 +1,850 @@
+#### PAKKER ####
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(sf)
+library(deldir)
+library(ggplot2)
+library(patchwork)
+library(shiny)
+
+#### INDLÆS DATA ####
+# Indlæs csv-filen
+vbob <- read.csv("vbob.csv", header = FALSE, sep = ",")
+
+# Indlæs metadata
+vbob_meta <- read_json("vbob-meta.json")
+
+# Indlæs compressed json trackingdata
+con <- bzfile("vbob-data.json.bz2", open = "rt")
+txt <- readLines(con, warn = FALSE)
+close(con)
+
+# Saml alle linjer til én tekst
+txt_all <- paste(txt, collapse = "\n")
+
+# Indsæt komma mellem json-objekter
+txt_fixed <- gsub("}\\s*\\n\\s*\\{", "},\n{", txt_all)
+
+# Gør teksten til én samlet json-liste
+txt_fixed <- paste0("[\n", txt_fixed, "\n]")
+
+# Læs json til dataframe/liste-struktur
+vbob_json <- fromJSON(txt_fixed, simplifyDataFrame = TRUE)
+
+#### HJÆLPEFUNKTION TIL SPILLERE ####
+
+# Funktion der henter spillerdata fra et frame
+extract_players <- function(frame, team_name) {
+  
+  # Stop hvis frame er tomt
+  if (is.null(frame)) return(NULL)
+  
+  # Kopiér frame
+  df <- frame
+  
+  # Tilføj holdnavn
+  df$team <- team_name
+  
+  # Split xyz til x, y og z
+  coords <- do.call(rbind, df$xyz)
+  colnames(coords) <- c("x", "y", "z")
+  
+  # Saml koordinater med resten af data
+  df <- cbind(df, coords)
+  
+  # Fjern original xyz-kolonne
+  df$xyz <- NULL
+  
+  # Returnér dataframe
+  return(df)
+}
+
+
+#### SAML ALLE FRAMES ####
+# Loop gennem alle frames og hent spillere
+all_players <- lapply(1:nrow(vbob_json), function(i) {
+  
+  # Vælg ét frame
+  frame <- vbob_json[i, ]
+  
+  # Hent hjemmehold
+  home <- extract_players(frame$homePlayers[[1]], "home")
+  
+  # Hent udehold
+  away <- extract_players(frame$awayPlayers[[1]], "away")
+  
+  # Saml begge hold
+  players <- bind_rows(home, away)
+  
+  # Spring over hvis tomt
+  if (is.null(players) || nrow(players) == 0) return(NULL)
+  
+  # Tilføj frame-id
+  players$frameIdx <- frame$frameIdx
+  
+  # Tilføj halvleg/periode
+  players$period <- frame$period
+  
+  # Returnér spillerdata
+  return(players)
+})
+
+# Saml alle frames til én dataframe
+players_df <- bind_rows(all_players)
+
+#### TILFØJ TID ####
+# Beregn tid i sekunder ud fra fps
+players_df$time_sec <- players_df$frameIdx / vbob_meta$fps
+
+#### KLARGØR METADATA ####
+# Hent metadata for hjemmeholdets spillere
+meta_home <- bind_rows(lapply(vbob_meta$homePlayers, as.data.frame)) %>%
+  mutate(team = "home")
+
+# Hent metadata for udeholdets spillere
+meta_away <- bind_rows(lapply(vbob_meta$awayPlayers, as.data.frame)) %>%
+  mutate(team = "away")
+
+# Saml metadata
+meta_players <- bind_rows(meta_home, meta_away)
+
+# Omdøb spiller-id så det matcher trackingdata
+meta_players <- meta_players %>%
+  rename(playerId = ssiId)
+
+meta_players <- meta_players %>%
+  rename(number.x = number)
+
+
+#### MERGE SPILLERDATA OG METADATA ####
+# Join metadata på spillerdata
+players_df <- left_join(players_df, meta_players, by = c("playerId", "team"))
+
+#### TJEK DATA ####
+# Tjek hvor mange navne der mangler
+sum(is.na(players_df$name))
+# Tjek hvor mange numre der mangler
+sum(is.na(players_df$number))
+# Tjek hvor mange positioner der mangler
+sum(is.na(players_df$position))
+
+#### DEFINÉR BANE ####
+# Standard banemål i meter
+pitch_length <- 105
+pitch_width  <- 68
+
+# Koordinater med centrum i (0,0)
+xmin <- -pitch_length / 2
+xmax <-  pitch_length / 2
+ymin <- -pitch_width / 2
+ymax <-  pitch_width / 2
+
+# Lidt bredere rå grænser til trackingdata
+xmin_raw <- -60
+xmax_raw <-  60
+ymin_raw <- -40
+ymax_raw <-  40
+
+
+# Definér hele banen som polygon
+pitch <- st_as_sfc(
+  st_bbox(c(xmin = xmin, ymin = ymin, xmax = xmax, ymax = ymax),
+          crs = st_crs(3857))
+)
+
+# Definér venstre halvdel
+left_half <- st_as_sfc(
+  st_bbox(c(xmin = xmin, ymin = ymin, xmax = 0, ymax = ymax),
+          crs = st_crs(3857))
+)
+
+# Definér højre halvdel
+right_half <- st_as_sfc(
+  st_bbox(c(xmin = 0, ymin = ymin, xmax = xmax, ymax = ymax),
+          crs = st_crs(3857))
+)
+
+#### DEFINÉR ANGREBSRETNING ####
+# Antag holdenes angrebsretning i hver halvleg
+players_df <- players_df %>%
+  mutate(
+    attacking_right = case_when(
+      period == 1 & team == "home" ~ TRUE,
+      period == 1 & team == "away" ~ FALSE,
+      period == 2 & team == "home" ~ FALSE,
+      period == 2 & team == "away" ~ TRUE,
+      TRUE ~ NA
+    )
+  )
+
+
+
+#### bolddata udfra CSV ####
+#lav ny dataframe med kolonne navne
+ball_df <- vbob %>%
+  transmute(
+    frameIdx = V1,
+    time_sec = V2,
+    ball_x = V69,
+    ball_y = V70
+  ) %>%
+  arrange(frameIdx)
+
+
+# søgning efter mål ud fra frames, hvor bolden er tæt på en mållinje og inden for målets bredde.
+goal_line_x <- 52.5
+goal_half_width <- 7.32 / 2
+
+#### FIND FRAMES HVOR BOLDEN ER INDE I MÅLET ####
+goal_frames_exact <- ball_df %>%
+  filter(
+    abs(ball_x) >= goal_line_x,
+    abs(ball_y) <= goal_half_width
+  )
+
+# pil tidspunktet ud for det første mål fra goal_frames exact
+first_goal_time <- goal_frames_exact$time_sec[1]
+first_goal_time
+# Det første mål sker ved 1464 sekunder, divider med 60 for at få minutter
+1464.96/60
+# Det første mål sker i 24. minut
+
+
+
+
+#### TILFØJ RIGTIGE HOLDNAVNE ####
+# Opret ny kolonne så home og away får rigtige holdnavne
+players_df <- players_df %>%
+  mutate(
+    team_name = case_when(
+      team == "home" ~ "Vejle Boldklub",
+      team == "away" ~ "OB",
+      TRUE ~ team
+    )
+  )
+
+
+
+
+
+#### definer frames vi gerne vil se til voronoi og delauney ####
+goal_frames_to_plot <- c(
+  goal_frames_exact$frameIdx[1] - 50,     # 50 frames før det første mål
+  goal_frames_exact$frameIdx[1] - 20,      # 20 frames før det første mål
+  goal_frames_exact$frameIdx[1],          # Det første mål
+  goal_frames_exact$frameIdx[1] + 10.      # 10 frames efter det første mål
+)
+
+# det drejer sig om disse frames
+goal_frames_to_plot
+
+
+#### FUNKTION TIL DELAUNAY-PLOT OMKRING MÅLET ####
+plot_goal_delaunay <- function(frame_number) {
+  
+  # Hent spillere i valgt frame
+  df <- players_df %>%
+    filter(frameIdx == frame_number) %>%
+    filter(!is.na(x), !is.na(y)) %>%
+    distinct(playerId, .keep_all = TRUE)
+  
+  # Stop hvis der er for få spillere
+  if (nrow(df) < 4) {
+    message("For få spillere i dette frame")
+    return(NULL)
+  }
+  
+  # Hent boldens position i valgt frame
+  ball <- vbob %>%
+    filter(V1 == frame_number) %>%
+    transmute(
+      x = V69,
+      y = V70
+    )
+  
+  # Stop hvis bolden mangler
+  if (nrow(ball) == 0) {
+    message("Ingen bolddata i dette frame")
+    return(NULL)
+  }
+  
+  # Beregn Delaunay-triangulering ud fra spillernes positioner
+  dd <- deldir::deldir(df$x, df$y)
+  
+  # Hent linjestykkerne fra trianguleringen
+  segs <- dd$delsgs
+  
+  # Lav data til midtercirklen
+  circle <- data.frame(
+    x = 9.15 * cos(seq(0, 2 * pi, length.out = 200)),
+    y = 9.15 * sin(seq(0, 2 * pi, length.out = 200))
+  )
+  
+  # Lav plot
+  ggplot() +
+    
+    # Tegn hele banen med mørk baggrund
+    geom_rect(aes(xmin = -52.5, xmax = 52.5, ymin = -34, ymax = 34),
+              fill = "#0D0D0D", color = "#CFCFCF", linewidth = 0.7) +
+    
+    # Tegn midterlinjen
+    geom_segment(aes(x = 0, y = -34, xend = 0, yend = 34),
+                 color = "#CFCFCF", linewidth = 0.45, alpha = 0.85) +
+    
+    # Tegn midtercirklen
+    geom_path(data = circle,
+              aes(x = x, y = y),
+              color = "#CFCFCF", linewidth = 0.45, alpha = 0.85) +
+    
+    # Tegn venstre straffesparksfelt
+    geom_rect(aes(xmin = -52.5, xmax = -36, ymin = -20.16, ymax = 20.16),
+              fill = NA, color = "#CFCFCF", linewidth = 0.45) +
+    
+    # Tegn højre straffesparksfelt
+    geom_rect(aes(xmin = 36, xmax = 52.5, ymin = -20.16, ymax = 20.16),
+              fill = NA, color = "#CFCFCF", linewidth = 0.45) +
+    
+    # Tegn venstre målfelt
+    geom_rect(aes(xmin = -52.5, xmax = -47, ymin = -9.16, ymax = 9.16),
+              fill = NA, color = "#CFCFCF", linewidth = 0.45) +
+    
+    # Tegn højre målfelt
+    geom_rect(aes(xmin = 47, xmax = 52.5, ymin = -9.16, ymax = 9.16),
+              fill = NA, color = "#CFCFCF", linewidth = 0.45) +
+    
+    # Tegn venstre mållinje
+    geom_segment(aes(x = -52.5, y = -4, xend = -52.5, yend = 4),
+                 color = "#FFD700", linewidth = 1) +
+    
+    # Tegn højre mållinje
+    geom_segment(aes(x = 52.5, y = -4, xend = 52.5, yend = 4),
+                 color = "#FFD700", linewidth = 1) +
+    
+    # Tegn Delaunay-linjer mellem spillerne
+    geom_segment(data = segs,
+                 aes(x = x1, y = y1, xend = x2, yend = y2),
+                 color = "#E6E6E6", linewidth = 0.45, alpha = 0.75) +
+    
+    # Tegn spillerne
+    geom_point(data = df,
+               aes(x = x, y = y, fill = team_name),
+               shape = 21, color = "white", stroke = 0.7, size = 5.3) +
+    
+    # Skriv spillernummer inde i punkterne
+    geom_text(data = df,
+              aes(x = x, y = y, label = number.x),
+              color = "white", size = 3, fontface = "bold") +
+    
+    # Tegn bolden
+    geom_point(data = ball,
+               aes(x = x, y = y),
+               shape = 21,
+               fill = "#FFD700",
+               color = "black",
+               size = 5.5,
+               stroke = 1.1) +
+    
+    # Lås koordinaterne så banen beholder de rigtige proportioner
+    coord_cartesian(xlim = c(-55, 55), ylim = c(-34, 34)) +
+    
+    # Giv holdene rigtige farver og navne i legend F8766D
+    scale_fill_manual(
+      values = c(
+        "Vejle Boldklub" = "#F8766D",
+        "OB" = "#13C2C2"
+      ),
+      breaks = c("OB", "Vejle Boldklub")
+    ) +
+    
+    # Tilføj titel og legend
+    labs(
+      title = ("OB scorer på trods af VB´s tætte forsvar"),
+      subtitle = paste("Delauney - frame", frame_number),
+      fill = NULL
+    ) +
+    
+    # Fjern akser og giv et rent layout
+    theme_void() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5, color = "white"),
+      plot.subtitle = element_text(size = 11, hjust = 0.5, color = "#D9D9D9"),
+      plot.background = element_rect(fill = "#0D0D0D", color = NA),
+      panel.background = element_rect(fill = "#0D0D0D", color = NA),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.text = element_text(color = "white", size = 12),
+      legend.background = element_rect(fill = "#0D0D0D", color = NA),
+      legend.key = element_rect(fill = "#0D0D0D", color = NA),
+      plot.margin = margin(15, 15, 15, 15)
+    ) +
+    
+    # Gør legend-punkterne lidt større og pænere
+    guides(fill = guide_legend(
+      override.aes = list(shape = 21, size = 7, color = "white", stroke = 0.7),
+      nrow = 1
+    ))
+}
+
+
+
+
+
+
+
+#### FUNKTION TIL VORONOI-PLOT OMKRING MÅLET ####
+plot_goal_voronoi <- function(frame_number) {
+  
+  # Hent spillere i valgt frame
+  df <- players_df %>%
+    filter(frameIdx == frame_number) %>%
+    filter(!is.na(x), !is.na(y)) %>%
+    distinct(playerId, .keep_all = TRUE) %>%
+    distinct(x, y, .keep_all = TRUE)
+  
+  # Stop hvis der er for få spillere
+  if (nrow(df) < 4) {
+    message("For få spillere i dette frame")
+    return(NULL)
+  }
+  
+  # Hent boldens position i valgt frame
+  ball <- vbob %>%
+    filter(V1 == frame_number) %>%
+    transmute(
+      x = V69,
+      y = V70
+    )
+  
+  # Stop hvis bolden mangler
+  if (nrow(ball) == 0) {
+    message("Ingen bolddata i dette frame")
+    return(NULL)
+  }
+  
+  # Beregn Voronoi-diagram ud fra spillernes positioner
+  dd <- deldir::deldir(df$x, df$y, rw = c(-55, 55, -34, 34))
+  
+  # Hent Voronoi-cellerne
+  tiles <- deldir::tile.list(dd)
+  
+  # Byg polygon-data så ggplot kan tegne cellerne
+  poly_df <- purrr::map_dfr(seq_along(tiles), function(i) {
+    
+    # Vælg én celle
+    tile <- tiles[[i]]
+    
+    # Spring over hvis cellen ikke kan danne en polygon
+    if (length(tile$x) < 3 || length(tile$y) < 3) return(NULL)
+    
+    # Returnér koordinater til polygonen
+    data.frame(
+      x = c(tile$x, tile$x[1]),
+      y = c(tile$y, tile$y[1]),
+      id = i,
+      team_name = df$team_name[i]
+    )
+  })
+  
+  # Stop hvis ingen polygoner kunne laves
+  if (nrow(poly_df) == 0) {
+    message("Ingen gyldige Voronoi-celler i dette frame")
+    return(NULL)
+  }
+  
+  # Lav data til midtercirklen
+  circle <- data.frame(
+    x = 9.15 * cos(seq(0, 2 * pi, length.out = 200)),
+    y = 9.15 * sin(seq(0, 2 * pi, length.out = 200))
+  )
+  
+  # Lav plot
+  ggplot() +
+    
+    # Tegn hele banen med mørk baggrund
+    geom_rect(aes(xmin = -52.5, xmax = 52.5, ymin = -34, ymax = 34),
+              fill = "#0D0D0D", color = "#CFCFCF", linewidth = 0.7) +
+    
+    # Tegn midterlinjen
+    geom_segment(aes(x = 0, y = -34, xend = 0, yend = 34),
+                 color = "#CFCFCF", linewidth = 0.45, alpha = 0.85) +
+    
+    # Tegn midtercirklen
+    geom_path(data = circle,
+              aes(x = x, y = y),
+              color = "#CFCFCF", linewidth = 0.45, alpha = 0.85) +
+    
+    # Tegn venstre straffesparksfelt
+    geom_rect(aes(xmin = -52.5, xmax = -36, ymin = -20.16, ymax = 20.16),
+              fill = NA, color = "#CFCFCF", linewidth = 0.45) +
+    
+    # Tegn højre straffesparksfelt
+    geom_rect(aes(xmin = 36, xmax = 52.5, ymin = -20.16, ymax = 20.16),
+              fill = NA, color = "#CFCFCF", linewidth = 0.45) +
+    
+    # Tegn venstre målfelt
+    geom_rect(aes(xmin = -52.5, xmax = -47, ymin = -9.16, ymax = 9.16),
+              fill = NA, color = "#CFCFCF", linewidth = 0.45) +
+    
+    # Tegn højre målfelt
+    geom_rect(aes(xmin = 47, xmax = 52.5, ymin = -9.16, ymax = 9.16),
+              fill = NA, color = "#CFCFCF", linewidth = 0.45) +
+    
+    # Tegn venstre mållinje
+    geom_segment(aes(x = -52.5, y = -4, xend = -52.5, yend = 4),
+                 color = "#FFD700", linewidth = 1) +
+    
+    # Tegn højre mållinje
+    geom_segment(aes(x = 52.5, y = -4, xend = 52.5, yend = 4),
+                 color = "#FFD700", linewidth = 1) +
+    
+    # Tegn Voronoi-cellerne
+    geom_polygon(data = poly_df,
+                 aes(x = x, y = y, group = id, fill = team_name),
+                 alpha = 0.16, color = "#E6E6E6", linewidth = 0.4) +
+    
+    # Tegn spillerne
+    geom_point(data = df,
+               aes(x = x, y = y, fill = team_name),
+               shape = 21, color = "white", stroke = 0.7, size = 5.3) +
+    
+    # Skriv spillernummer inde i punkterne
+    geom_text(data = df,
+              aes(x = x, y = y, label = number.x),
+              color = "white", size = 3, fontface = "bold") +
+    
+    # Tegn bolden
+    geom_point(data = ball,
+               aes(x = x, y = y),
+               shape = 21,
+               fill = "#FFD700",
+               color = "black",
+               size = 5.5,
+               stroke = 1.1) +
+    
+    # Lås koordinaterne så banen beholder de rigtige proportioner
+    coord_cartesian(xlim = c(-55, 55), ylim = c(-34, 34)) +
+    
+    # Giv holdene rigtige farver og navne i legend F8766D
+    scale_fill_manual(
+      values = c(
+        "Vejle Boldklub" = "#F8766D",
+        "OB" = "#13C2C2"
+      ),
+      breaks = c("OB", "Vejle Boldklub")
+    ) +
+    
+    # Tilføj titel og legend
+    labs(
+      title = ("OB ejer størstedelen af banens areal før mål"),
+      subtitle = paste("Voronoi - frame", frame_number),
+      fill = NULL
+    ) +
+    
+    # Fjern akser og giv et rent layout
+    theme_void() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5, color = "white"),
+      plot.subtitle = element_text(size = 11, hjust = 0.5, color = "#D9D9D9"),
+      plot.background = element_rect(fill = "#0D0D0D", color = NA),
+      panel.background = element_rect(fill = "#0D0D0D", color = NA),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.text = element_text(color = "white", size = 12),
+      legend.background = element_rect(fill = "#0D0D0D", color = NA),
+      legend.key = element_rect(fill = "#0D0D0D", color = NA),
+      plot.margin = margin(15, 15, 15, 15)
+    ) +
+    
+    # Gør legend-punkterne lidt større og pænere
+    guides(fill = guide_legend(
+      override.aes = list(shape = 21, size = 7, color = "white", stroke = 0.7),
+      nrow = 1
+    ))
+}
+
+
+
+
+
+#### brug funktionerne på frames omkring målet ####
+plot_goal_delaunay(goal_frames_to_plot[1])
+plot_goal_delaunay(goal_frames_to_plot[2])
+plot_goal_delaunay(goal_frames_to_plot[3])
+
+plot_goal_voronoi(goal_frames_to_plot[1])
+plot_goal_voronoi(goal_frames_to_plot[2])
+plot_goal_voronoi(goal_frames_to_plot[3])
+
+
+
+
+
+
+
+
+
+
+
+#### beregne spiller med mest areal udfra voronoi ####
+#### FUNKTION TIL VORONOI-AREAL I MODSTANDERENS ZONE ####
+calc_frame_voronoi_area <- function(frame_data, zone = "opponent_half") {
+  
+  # Rens data
+  df <- frame_data %>%
+    filter(!is.na(x), !is.na(y), !is.na(team), !is.na(playerId)) %>%
+    distinct(playerId, .keep_all = TRUE) %>%
+    distinct(x, y, .keep_all = TRUE)
+  
+  # Stop hvis der er for få spillere
+  if (nrow(df) < 4) return(NULL)
+  
+  # Definér hele banen som polygon
+  pitch_poly <- st_polygon(list(matrix(
+    c(-52.5, -34,
+      52.5, -34,
+      52.5,  34,
+      -52.5,  34,
+      -52.5, -34),
+    ncol = 2,
+    byrow = TRUE
+  )))
+  
+  pitch_sf <- st_sfc(pitch_poly)
+  
+  # Hjælpefunktion der laver den relevante zone for én spiller
+  get_target_zone <- function(team_name, attacking_right_value, zone_type) {
+    
+    # Stop hvis angrebsretning mangler
+    if (is.na(attacking_right_value)) return(NULL)
+    
+    # Hvis spilleren angriber mod højre
+    if (attacking_right_value) {
+      
+      # Modstanderens halvdel = højre halvdel
+      if (zone_type == "opponent_half") {
+        zone_poly <- st_polygon(list(matrix(
+          c(0,    -34,
+            52.5, -34,
+            52.5,  34,
+            0,     34,
+            0,    -34),
+          ncol = 2,
+          byrow = TRUE
+        )))
+      }
+      
+      # Modstanderens felt = højre straffesparksfelt
+      if (zone_type == "opponent_box") {
+        zone_poly <- st_polygon(list(matrix(
+          c(36,   -20.16,
+            52.5, -20.16,
+            52.5,  20.16,
+            36,    20.16,
+            36,   -20.16),
+          ncol = 2,
+          byrow = TRUE
+        )))
+      }
+      
+    } else {
+      
+      # Modstanderens halvdel = venstre halvdel
+      if (zone_type == "opponent_half") {
+        zone_poly <- st_polygon(list(matrix(
+          c(-52.5, -34,
+            0,    -34,
+            0,     34,
+            -52.5,  34,
+            -52.5, -34),
+          ncol = 2,
+          byrow = TRUE
+        )))
+      }
+      
+      # Modstanderens felt = venstre straffesparksfelt
+      if (zone_type == "opponent_box") {
+        zone_poly <- st_polygon(list(matrix(
+          c(-52.5, -20.16,
+            -36,   -20.16,
+            -36,    20.16,
+            -52.5,  20.16,
+            -52.5, -20.16),
+          ncol = 2,
+          byrow = TRUE
+        )))
+      }
+    }
+    
+    st_sfc(zone_poly)
+  }
+  
+  # Beregn Voronoi-diagram for hele banen
+  dd <- deldir::deldir(df$x, df$y, rw = c(-52.5, 52.5, -34, 34))
+  tiles <- deldir::tile.list(dd)
+  
+  # Stop hvis ingen tiles
+  if (length(tiles) == 0) return(NULL)
+  
+  # Gennemgå alle spillere og beregn areal i valgt zone
+  result_list <- purrr::map_dfr(seq_along(tiles), function(i) {
+    
+    tile <- tiles[[i]]
+    
+    # Spring over ugyldige polygoner
+    if (length(tile$x) < 3 || length(tile$y) < 3) return(NULL)
+    
+    # Lav Voronoi-polygon
+    tile_poly <- st_polygon(list(cbind(
+      c(tile$x, tile$x[1]),
+      c(tile$y, tile$y[1])
+    )))
+    
+    tile_sf <- st_sfc(tile_poly)
+    
+    # Klip polygon til banen
+    tile_clipped <- suppressWarnings(st_intersection(tile_sf, pitch_sf))
+    
+    # Spring over hvis polygonen blev tom
+    if (length(tile_clipped) == 0) return(NULL)
+    if (all(st_is_empty(tile_clipped))) return(NULL)
+    
+    # Hent zonen for den konkrete spiller
+    zone_sf <- get_target_zone(
+      team_name = df$team[i],
+      attacking_right_value = df$attacking_right[i],
+      zone_type = zone
+    )
+    
+    # Spring over hvis zone mangler
+    if (is.null(zone_sf)) return(NULL)
+    
+    # Klip polygon til modstanderens zone
+    zone_intersection <- suppressWarnings(st_intersection(tile_clipped, zone_sf))
+    
+    # Hvis spilleren ikke har noget areal i zonen, sættes arealet til 0
+    if (length(zone_intersection) == 0 || all(st_is_empty(zone_intersection))) {
+      area_value <- 0
+    } else {
+      area_value <- as.numeric(sum(st_area(zone_intersection)))
+    }
+    
+    # Returnér resultat for spilleren
+    data.frame(
+      frameIdx = df$frameIdx[i],
+      period = df$period[i],
+      team = df$team[i],
+      playerId = df$playerId[i],
+      name = df$name[i],
+      number.x = df$number.x[i],
+      x = df$x[i],
+      y = df$y[i],
+      attacking_right = df$attacking_right[i],
+      voronoi_area = area_value
+    )
+  })
+  
+  # Stop hvis tomt resultat
+  if (nrow(result_list) == 0) return(NULL)
+  
+  return(result_list)
+}
+
+# gør funktionen robust
+safe_voronoi_calc <- purrr::possibly(calc_frame_voronoi_area, otherwise = NULL)
+
+#### UDVÆLG FRAMES ####
+# Tag fx hvert 50. frame for hurtigere beregning
+sampled_frames <- players_df %>%
+  distinct(frameIdx) %>%
+  arrange(frameIdx) %>%
+  slice(seq(1, n(), by = 250)) %>%
+  pull(frameIdx)
+
+#### BEREGN VORONOI-AREAL FOR ALLE UDVALGTE FRAMES ####
+voronoi_results <- map_dfr(sampled_frames, function(f) {
+  
+  frame_data <- players_df %>% filter(frameIdx == f)
+  
+  safe_voronoi_calc(frame_data, zone = "opponent_half")
+})
+
+
+#### OPSUMMÉR VORONOI-RESULTATER ####
+top_voronoi_players <- voronoi_results %>%
+  group_by(team, playerId, name, number.x) %>%
+  summarise(
+    mean_area = mean(voronoi_area, na.rm = TRUE),
+    median_area = median(voronoi_area, na.rm = TRUE),
+    max_area = max(voronoi_area, na.rm = TRUE),
+    n_frames = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_area))
+
+
+#### TOP 10 SPILLERE MED STØRST VORONOI-AREAL ####
+top10_voronoi <- top_voronoi_players %>%
+  slice_max(order_by = mean_area, n = 10)
+
+
+#### TILFØJ HOLDNAVNE OG LABELS ####
+top10_voronoi <- top10_voronoi %>%
+  mutate(
+    team_name = case_when(
+      team == "home" ~ "Vejle Boldklub",
+      team == "away" ~ "OB",
+      TRUE ~ team
+    ),
+    last_name = sub(".* ", "", name),
+    label = paste0(last_name, " (#", number.x, ")")
+  )
+
+
+#### LAV SØJLEDIAGRAM FOR VORONOI-AREAL ####
+ggplot(top10_voronoi, aes(x = reorder(label, mean_area), y = mean_area, fill = team_name)) +
+  
+  # Lav søjler
+  geom_col(width = 0.7, color = "white", linewidth = 0.25) +
+  
+  # Vend koordinater
+  coord_flip() +
+  
+  # Samme farver som de andre plots.
+  scale_fill_manual(
+    values = c(
+      "Vejle Boldklub" = "#F8766D",
+      "OB" = "#13C2C2"
+    )
+  ) +
+  
+  # Tilføj titel og aksetekster
+  labs(
+    title = "Spillere med størst areal i modstanderens zone",
+    subtitle = "Målt som gennemsnitligt areal i m² (Voronoi)",
+    x = NULL,
+    y = "Gennemsnitligt areal (m²)",
+    fill = "Hold"
+  ) +
+  
+  # Mørkt tema
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 1, color = "white"),
+    plot.subtitle = element_text(size = 11, hjust = 1, color = "#D9D9D9"),
+    axis.title.x = element_text(size = 11, color = "white", face = "bold"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 10, color = "white"),
+    axis.text.y = element_text(size = 10, color = "white"),
+    panel.grid.major.x = element_line(color = "#404040", linewidth = 0.4),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "#0D0D0D", color = NA),
+    plot.background = element_rect(fill = "#0D0D0D", color = NA),
+    legend.position = "bottom",
+    legend.title = element_text(color = "white", face = "bold"),
+    legend.text = element_text(color = "white"),
+    legend.background = element_rect(fill = "#0D0D0D", color = NA),
+    legend.key = element_rect(fill = "#0D0D0D", color = NA),
+    plot.margin = margin(15, 15, 15, 25)
+  )

@@ -1208,7 +1208,7 @@ WHERE e.SEASON_WYID = 191611
 # Feature engineering på Brøndby-data
 brondby_data <- brondby_raw %>%
   mutate(
-    # 🔧 RENS DATA (MEGET VIGTIG)
+    # RENS DATA (MEGET VIGTIG)
     clean_bodypart = str_replace_all(SHOTBODYPART, "[\\[\\]\\n\",]", ""),
     clean_bodypart = str_trim(clean_bodypart),
     

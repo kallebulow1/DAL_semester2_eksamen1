@@ -1,1 +1,1193 @@
+############################################################
+## OPGAVE 2.1 – Expected Points (xP) for Superligaen 2024/25
+##
+## Formål:
+## 1) Hente kamp- og skuddata for Superligaen 2024/2025
+## 2) Beregne xG pr. skud med den allerede trænede xG-model
+## 3) Aggregere xG til kampniveau
+## 4) Simulere kampene mange gange
+## 5) Beregne Expected Points (xP) for alle hold
+## 6) Præsentere resultaterne i en Shiny-app til Brøndby IF
+##
+## Forudsætter, at disse objekter allerede findes:
+## - con
+## - xgb_model
+## - train_x
+############################################################
+
+## =========================================================
+## 0) Pakker
+## =========================================================
+library(DBI)
+library(RMariaDB)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(shiny)
+library(bslib)
+library(DT)
+library(scales)
+library(purrr)
+
+## =========================================================
+## 1) Database connection
+## =========================================================
+con <- dbConnect(
+  RMariaDB::MariaDB(),
+  host     = "www.talmedos.com",
+  port     = 3306,
+  user     = "dalremote",
+  password = "OttoRehagel123456789Long2026!",
+  dbname   = "superliga2"
+)
+
+## =========================================================
+## 2) Tjek nødvendige objekter
+## =========================================================
+needed_objects <- c("con", "xgb_model", "train_x")
+missing_objects <- needed_objects[!sapply(needed_objects, exists)]
+
+if (length(missing_objects) > 0) {
+  stop(
+    paste(
+      "Følgende objekter mangler i environment:",
+      paste(missing_objects, collapse = ", ")
+    )
+  )
+}
+
+## =========================================================
+## 3) Parametre
+## =========================================================
+season_id <- 189918
+competition_id <- 335
+n_sims <- 5000
+playoff_match_id <- 5707602   # European playoff ekskluderes
+
+set.seed(123)
+
+## =========================================================
+## 4) Hjælpefunktioner
+## =========================================================
+
+# Gør modelmatrix kompatibel med train_x fra den tidligere xG-model
+# Funktion der sikrer, at vores nye data har PRÆCIS samme struktur som træningsdata
+align_model_matrix <- function(new_matrix, reference_matrix) {
+  
+  # Finder kolonner der mangler i new_matrix ift. reference (train_x)
+  missing_cols <- setdiff(colnames(reference_matrix), colnames(new_matrix))
+  
+  # Finder kolonner der er ekstra i new_matrix (som modellen ikke kender)
+  extra_cols   <- setdiff(colnames(new_matrix), colnames(reference_matrix))
+  
+  # Hvis der mangler kolonner → tilføj dem med værdi 0
+  if (length(missing_cols) > 0) {
+    for (col in missing_cols) {
+      new_matrix <- cbind(new_matrix, 0)  # tilføjer kolonne med 0
+      colnames(new_matrix)[ncol(new_matrix)] <- col  # giver korrekt navn
+    }
+  }
+  
+  # Hvis der er ekstra kolonner → fjern dem
+  if (length(extra_cols) > 0) {
+    new_matrix <- new_matrix[, setdiff(colnames(new_matrix), extra_cols), drop = FALSE]
+  }
+  
+  # Sørger for at kolonnerne er i samme rækkefølge som træningsdata
+  new_matrix[, colnames(reference_matrix), drop = FALSE]
+}
+
+# Simulerer én kamp ud fra shot-level xG
+simulate_match_xpoints <- function(match_id, team_1, team_2, shot_df, n_sims = 5000) {
+  
+  # Henter alle xG værdier (skud) for hold 1
+  probs_1 <- shot_df %>%
+    filter(MATCH_WYID == match_id, TEAM_WYID == team_1) %>%
+    pull(xg)
+  
+  # Henter alle xG værdier (skud) for hold 2
+  probs_2 <- shot_df %>%
+    filter(MATCH_WYID == match_id, TEAM_WYID == team_2) %>%
+    pull(xg)
+  
+  # Fjerner NA værdier (ellers crasher simulation)
+  probs_1 <- probs_1[!is.na(probs_1)]
+  probs_2 <- probs_2[!is.na(probs_2)]
+  
+  # Sørger for at sandsynligheder ligger mellem 0.01 og 0.99
+  # (ellers kan rbinom opføre sig mærkeligt)
+  probs_1 <- pmin(pmax(probs_1, 0.01), 0.99)
+  probs_2 <- pmin(pmax(probs_2, 0.01), 0.99)
+  
+  # Simulerer antal mål for hold 1
+  sim_goals_1 <- replicate(
+    n_sims,
+    if (length(probs_1) == 0) 0 else 
+      sum(rbinom(length(probs_1), size = 1, prob = probs_1))
+  )
+  
+  # Simulerer antal mål for hold 2
+  sim_goals_2 <- replicate(
+    n_sims,
+    if (length(probs_2) == 0) 0 else 
+      sum(rbinom(length(probs_2), size = 1, prob = probs_2))
+  )
+  
+  # Beregner sandsynligheder for udfald
+  win_1  <- mean(sim_goals_1 > sim_goals_2)   # hold 1 vinder
+  draw_1 <- mean(sim_goals_1 == sim_goals_2)  # uafgjort
+  loss_1 <- mean(sim_goals_1 < sim_goals_2)   # hold 1 taber
+  
+  # Samme for hold 2
+  win_2  <- mean(sim_goals_2 > sim_goals_1)
+  draw_2 <- mean(sim_goals_2 == sim_goals_1)
+  loss_2 <- mean(sim_goals_2 < sim_goals_1)
+  
+  # Omregner til point (3-1-0 system)
+  tibble(
+    MATCH_WYID = match_id,
+    TEAM_WYID  = c(team_1, team_2),
+    xPoints    = c(3 * win_1 + 1 * draw_1, 3 * win_2 + 1 * draw_2),
+    win_prob   = c(win_1, win_2),
+    draw_prob  = c(draw_1, draw_2),
+    loss_prob  = c(loss_1, loss_2)
+  )
+}
+
+# Bygger faktiske mål og point fra MATCHLABEL
+# Det er nødvendigt, fordi datasættet ikke er komplet på eventdata
+build_actual_match_long <- function(matches_tbl, competition_id, season_id) {
+  
+  matches_results_tbl <- matches_tbl %>%
+    mutate(
+      teams_part    = str_trim(str_extract(MATCHLABEL, "^[^,]+")),
+      score_part    = str_trim(str_extract(MATCHLABEL, "[0-9]+\\s*-\\s*[0-9]+$")),
+      home_team_raw = str_trim(str_extract(teams_part, "^[^-]+")),
+      away_team_raw = str_trim(str_extract(teams_part, "(?<=- ).*")),
+      home_goals    = as.numeric(str_extract(score_part, "^[0-9]+")),
+      away_goals    = as.numeric(str_extract(score_part, "(?<=-\\s)[0-9]+"))
+    )
+  
+  # Tilføj den ene manglende kamp manuelt
+  missing_result_row <- tibble(
+    MATCH_WYID       = 5585758,
+    MATCHLABEL       = "SønderjyskE - Midtjylland, 3 - 2",
+    DATE             = as.POSIXct("2024-10-20 18:00:00", tz = "UTC"),
+    DATEUTC          = as.POSIXct("2024-10-20 16:00:00", tz = "UTC"),
+    MATCHSTATUS      = "Played",
+    COMPETITION_WYID = competition_id,
+    SEASON_WYID      = season_id,
+    ROUND_WYID       = NA_integer_,
+    GAMEWEEK         = 12,
+    teams_part       = "SønderjyskE - Midtjylland",
+    score_part       = "3 - 2",
+    home_team_raw    = "SønderjyskE",
+    away_team_raw    = "Midtjylland",
+    home_goals       = 3,
+    away_goals       = 2
+  )
+  
+  matches_results_tbl <- bind_rows(matches_results_tbl, missing_result_row)
+  
+  team_name_lookup <- tribble(
+    ~label_name,    ~team_name,
+    "København",    "FC København",
+    "Brøndby",      "Brøndby IF",
+    "AaB",          "Aalborg BK",
+    "Midtjylland",  "FC Midtjylland",
+    "Viborg",       "Viborg FF",
+    "AGF",          "AGF",
+    "Nordsjælland", "FC Nordsjælland",
+    "Silkeborg",    "Silkeborg IF",
+    "Randers",      "Randers FC",
+    "Vejle",        "Vejle Boldklub",
+    "Lyngby",       "Lyngby Boldklub",
+    "Sønderjyske",  "SønderjyskE",
+    "SønderjyskE",  "SønderjyskE"
+  )
+  
+  matches_results_tbl %>%
+    select(MATCH_WYID, DATE, home_team_raw, away_team_raw, home_goals, away_goals) %>%
+    pivot_longer(
+      cols = c(home_team_raw, away_team_raw),
+      names_to = "home_away",
+      values_to = "label_name"
+    ) %>%
+    left_join(team_name_lookup, by = "label_name") %>%
+    mutate(
+      goals_for = ifelse(home_away == "home_team_raw", home_goals, away_goals),
+      goals_against = ifelse(home_away == "home_team_raw", away_goals, home_goals),
+      actual_points = case_when(
+        goals_for > goals_against ~ 3,
+        goals_for == goals_against ~ 1,
+        TRUE ~ 0
+      )
+    ) %>%
+    select(MATCH_WYID, DATE, team_name, goals_for, goals_against, actual_points)
+}
+
+## =========================================================
+## 5) Hent kamp- og holddata
+## =========================================================
+
+# Kampunivers: vi tager kun played kampe og ekskluderer playoff
+matches_tbl <- dbGetQuery(con, paste0("
+SELECT DISTINCT
+  c.MATCH_WYID,
+  m.MATCHLABEL,
+  m.DATE,
+  m.DATEUTC,
+  m.MATCHSTATUS,
+  m.COMPETITION_WYID,
+  m.SEASON_WYID,
+  m.ROUND_WYID,
+  m.GAMEWEEK
+FROM wyscout_matchevents_common c
+LEFT JOIN wyscout_matches m
+  ON c.MATCH_WYID = m.MATCH_WYID
+WHERE c.SEASON_WYID = ", season_id, "
+  AND c.COMPETITION_WYID = ", competition_id, ";
+")) %>%
+  as_tibble() %>%
+  filter(MATCHSTATUS == "Played") %>%
+  filter(MATCH_WYID != playoff_match_id)
+
+# Holdinfo
+teams_tbl <- dbGetQuery(con, paste0("
+SELECT
+  COMPETITION_WYID,
+  SEASON_WYID,
+  TEAM_WYID,
+  TEAMNAME,
+  OFFICIALNAME,
+  CITY
+FROM wyscout_teams
+WHERE SEASON_WYID = ", season_id, "
+  AND COMPETITION_WYID = ", competition_id, ";
+")) %>%
+  as_tibble() %>%
+  arrange(TEAM_WYID) %>%
+  distinct(TEAM_WYID, .keep_all = TRUE) %>%
+  mutate(team_name = OFFICIALNAME) %>%
+  select(TEAM_WYID, TEAMNAME, OFFICIALNAME, CITY, team_name)
+
+## =========================================================
+## 6) Byg kampunivers på holdniveau
+## =========================================================
+
+match_team_base <- dbGetQuery(con, paste0("
+SELECT DISTINCT
+  MATCH_WYID,
+  TEAM_WYID
+FROM wyscout_matchevents_common
+WHERE SEASON_WYID = ", season_id, "
+  AND COMPETITION_WYID = ", competition_id, ";
+")) %>%
+  as_tibble() %>%
+  semi_join(matches_tbl, by = "MATCH_WYID")
+
+# Hver kamp skal ende med to rækker: ét hold pr. række
+match_pairs <- match_team_base %>%
+  group_by(MATCH_WYID) %>%
+  summarise(
+    team_ids = list(sort(unique(TEAM_WYID))),
+    n_teams = n_distinct(TEAM_WYID),
+    .groups = "drop"
+  ) %>%
+  filter(n_teams == 2)
+
+match_team_universe <- bind_rows(
+  match_pairs %>%
+    transmute(
+      MATCH_WYID,
+      TEAM_WYID = map_int(team_ids, 1),
+      OPPONENTTEAM_WYID = map_int(team_ids, 2)
+    ),
+  match_pairs %>%
+    transmute(
+      MATCH_WYID,
+      TEAM_WYID = map_int(team_ids, 2),
+      OPPONENTTEAM_WYID = map_int(team_ids, 1)
+    )
+)
+
+## =========================================================
+## 7) Hent og klargør skuddata
+## =========================================================
+
+season_shots_raw <- dbGetQuery(con, paste0("
+WITH possession_start AS (
+  SELECT
+    POSSESSION_WYID,
+    PRIMARYTYPE AS possession_start_type,
+    ROW_NUMBER() OVER (
+      PARTITION BY POSSESSION_WYID
+      ORDER BY MATCH_WYID, MATCHPERIOD, MINUTE, SECOND, MATCHTIMESTAMP
+    ) AS rn
+  FROM wyscout_matchevents_common
+  WHERE SEASON_WYID = ", season_id, "
+    AND POSSESSION_WYID IS NOT NULL
+)
+
+SELECT
+  s.EVENT_WYID,
+  e.MATCH_WYID,
+  e.MINUTE,
+  e.SECOND,
+  e.LOCATIONX,
+  e.LOCATIONY,
+  e.TEAM_WYID,
+  e.OPPONENTTEAM_WYID,
+  e.PLAYER_WYID,
+  e.POSSESSION_WYID,
+  e.POSSESSIONDURATION,
+  s.SHOTISGOAL,
+  s.SHOTBODYPART,
+  ps.possession_start_type
+FROM wyscout_matchevents_shots s
+JOIN wyscout_matchevents_common e
+  ON s.EVENT_WYID = e.EVENT_WYID
+LEFT JOIN possession_start ps
+  ON e.POSSESSION_WYID = ps.POSSESSION_WYID
+ AND ps.rn = 1
+WHERE e.SEASON_WYID = ", season_id, "
+  AND e.COMPETITION_WYID = ", competition_id, "
+  AND LOWER(e.PRIMARYTYPE) = 'shot';
+")) %>%
+  as_tibble() %>%
+  distinct(EVENT_WYID, .keep_all = TRUE) %>%
+  mutate(
+    # Samme mål-logik som i din tidligere løsning
+    is_goal = as.integer(
+      SHOTISGOAL == 1 | str_detect(tolower(SHOTBODYPART), "goal")
+    )
+  )
+
+## =========================================================
+## 8) Feature engineering til xG-modellen
+## =========================================================
+
+season_model_data <- season_shots_raw %>%
+  mutate(
+    bodypart = case_when(
+      str_detect(tolower(SHOTBODYPART), "head") ~ "head",
+      str_detect(tolower(SHOTBODYPART), "left_foot") ~ "foot",
+      str_detect(tolower(SHOTBODYPART), "right_foot") ~ "foot",
+      str_detect(tolower(SHOTBODYPART), "foot") ~ "foot",
+      TRUE ~ "foot"
+    ),
+    set_piece_category = case_when(
+      tolower(possession_start_type) == "corner" ~ "corner",
+      tolower(possession_start_type) %in% c("free_kick", "penalty") ~ "free_kick_or_penalty",
+      tolower(possession_start_type) %in% c("throw_in", "goal_kick") ~ "restart_other",
+      TRUE ~ "open_play"
+    ),
+    x_meter = LOCATIONX * 105 / 100,
+    y_meter = LOCATIONY * 68 / 100,
+    distance_meter = sqrt((105 - x_meter)^2 + (34 - y_meter)^2),
+    goal_left_y  = 34 - 7.32 / 2,
+    goal_right_y = 34 + 7.32 / 2,
+    d_left  = sqrt((105 - x_meter)^2 + (goal_left_y - y_meter)^2),
+    d_right = sqrt((105 - x_meter)^2 + (goal_right_y - y_meter)^2),
+    cos_angle = (d_left^2 + d_right^2 - 7.32^2) / (2 * d_left * d_right),
+    cos_angle = pmin(pmax(cos_angle, -1), 1),
+    angle_deg = acos(cos_angle) * 180 / pi,
+    possession_duration = POSSESSIONDURATION
+  ) %>%
+  filter(
+    !is.na(distance_meter),
+    !is.na(angle_deg),
+    distance_meter < 60,
+    angle_deg < 120
+  ) %>%
+  mutate(
+    bodypart = factor(bodypart, levels = c("head", "foot", "other")),
+    set_piece_category = factor(
+      set_piece_category,
+      levels = c("open_play", "corner", "free_kick_or_penalty", "restart_other")
+    )
+  )
+
+## =========================================================
+## 9) Scor alle skud med xG-modellen
+## =========================================================
+
+# Laver modelmatrix (gør kategoriske variable til dummy-variabler)
+season_x <- model.matrix(
+  ~ distance_meter + angle_deg + bodypart +
+    possession_duration + set_piece_category - 1,
+  data = season_model_data
+)
+
+# Sørger for at matrix matcher træningsdata (meget vigtigt)
+season_x <- align_model_matrix(season_x, train_x)
+
+# Bruger XGBoost model til at forudsige xG for hvert skud
+season_model_data$xg <- predict(xgb_model, season_x)
+
+# Rens xG-output og kalibrér til realistisk kampniveau
+season_model_data <- season_model_data %>%
+  mutate(
+    xg = as.numeric(xg),       # sikrer korrekt datatype
+    xg = ifelse(is.na(xg), 0, xg),  # NA → 0
+    xg = pmax(xg, 0),          # minimum 0
+    xg = pmin(xg, 1)           # maksimum 1
+  )
+
+# Finder gennemsnitlig xG pr kamp pr hold
+current_team_match_xg <- season_model_data %>%
+  group_by(MATCH_WYID, TEAM_WYID) %>%
+  summarise(team_match_xg = sum(xg, na.rm = TRUE), .groups = "drop") %>%
+  summarise(mean_xg = mean(team_match_xg, na.rm = TRUE)) %>%
+  pull(mean_xg)
+
+# Vi ønsker realistisk niveau (ca. 1.4 mål pr kamp)
+target_team_match_xg <- 1.40
+
+# Skaleringsfaktor
+scaling_factor <- target_team_match_xg / current_team_match_xg
+
+# Justerer xG
+season_model_data <- season_model_data %>%
+  mutate(
+    xg = xg * scaling_factor,
+    xg = pmin(xg, 1)
+  )
+
+## =========================================================
+## 10) Aggregér til kampniveau
+## =========================================================
+
+# Faktiske mål fra shot-data
+actual_goals_by_team <- season_shots_raw %>%
+  group_by(MATCH_WYID, TEAM_WYID) %>%
+  summarise(
+    goals_for = sum(is_goal, na.rm = TRUE),
+    raw_shots = n(),
+    .groups = "drop"
+  )
+
+# xG på kampniveau
+xg_by_team <- season_model_data %>%
+  group_by(MATCH_WYID, TEAM_WYID) %>%
+  summarise(
+    model_shots = n(),
+    xg_for = sum(xg, na.rm = TRUE),
+    avg_xg_per_shot = mean(xg, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Spejling til modstander-perspektiv
+actual_goals_opp <- actual_goals_by_team %>%
+  rename(
+    OPPONENTTEAM_WYID = TEAM_WYID,
+    goals_against = goals_for,
+    opp_raw_shots = raw_shots
+  )
+
+xg_opp <- xg_by_team %>%
+  rename(
+    OPPONENTTEAM_WYID = TEAM_WYID,
+    opp_model_shots = model_shots,
+    xg_against = xg_for,
+    opp_avg_xg_per_shot = avg_xg_per_shot
+  )
+
+# Samlet kampniveau-data
+match_team_stats <- match_team_universe %>%
+  
+  # Beholder kun relevante kampe
+  semi_join(matches_tbl, by = "MATCH_WYID") %>%
+  
+  # Tilføjer kampinfo
+  left_join(matches_tbl, by = "MATCH_WYID") %>%
+  
+  # Tilføjer holdnavne
+  left_join(teams_tbl %>% select(TEAM_WYID, team_name), by = "TEAM_WYID") %>%
+  
+  # Tilføjer modstander
+  left_join(
+    teams_tbl %>%
+      select(TEAM_WYID, team_name) %>%
+      rename(OPPONENTTEAM_WYID = TEAM_WYID, opponent_name = team_name),
+    by = "OPPONENTTEAM_WYID"
+  ) %>%
+  
+  # Tilføjer mål og xG
+  left_join(actual_goals_by_team, by = c("MATCH_WYID", "TEAM_WYID")) %>%
+  left_join(xg_by_team, by = c("MATCH_WYID", "TEAM_WYID")) %>%
+  left_join(actual_goals_opp, by = c("MATCH_WYID", "OPPONENTTEAM_WYID")) %>%
+  left_join(xg_opp, by = c("MATCH_WYID", "OPPONENTTEAM_WYID")) %>%
+  
+  # Håndterer manglende værdier
+  mutate(
+    goals_for = coalesce(goals_for, 0L),
+    goals_against = coalesce(goals_against, 0L),
+    xg_for = coalesce(xg_for, 0),
+    xg_against = coalesce(xg_against, 0),
+    
+    # Beregner faktiske point
+    actual_points = case_when(
+      goals_for > goals_against ~ 3,
+      goals_for == goals_against ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  
+  # Sikrer én række pr hold pr kamp
+  distinct(MATCH_WYID, TEAM_WYID, .keep_all = TRUE)
+
+## =========================================================
+## 11) Håndtér den ene manglende kamp
+## =========================================================
+## SønderjyskE - FC Midtjylland mangler eventdata,
+## så den estimeres ud fra home/away-gennemsnit
+
+missing_match_id        <- 5585758
+missing_home_team_id    <- 7499
+missing_away_team_id    <- 7455
+missing_home_team_name  <- "SønderjyskE"
+missing_away_team_name  <- "FC Midtjylland"
+missing_home_label_name <- "SønderjyskE"
+missing_away_label_name <- "Midtjylland"
+missing_match_label     <- "SønderjyskE - Midtjylland, 3 - 2"
+missing_match_date      <- as.POSIXct("2024-10-20 18:00:00", tz = "UTC")
+missing_match_dateutc   <- as.POSIXct("2024-10-20 16:00:00", tz = "UTC")
+missing_gameweek        <- 12
+missing_home_goals      <- 3L
+missing_away_goals      <- 2L
+
+sonder_home_stats <- match_team_stats %>%
+  filter(
+    TEAM_WYID == missing_home_team_id,
+    str_starts(MATCHLABEL, paste0(missing_home_label_name, " - "))
+  )
+
+midt_away_stats <- match_team_stats %>%
+  filter(
+    TEAM_WYID == missing_away_team_id,
+    !str_starts(MATCHLABEL, paste0(missing_away_label_name, " - "))
+  )
+
+sonder_home_xg_for     <- mean(sonder_home_stats$xg_for, na.rm = TRUE)
+sonder_home_xg_against <- mean(sonder_home_stats$xg_against, na.rm = TRUE)
+midt_away_xg_for       <- mean(midt_away_stats$xg_for, na.rm = TRUE)
+midt_away_xg_against   <- mean(midt_away_stats$xg_against, na.rm = TRUE)
+
+missing_home_lambda <- mean(c(sonder_home_xg_for, midt_away_xg_against), na.rm = TRUE)
+missing_away_lambda <- mean(c(midt_away_xg_for, sonder_home_xg_against), na.rm = TRUE)
+
+sim_home_goals <- rpois(n_sims, lambda = missing_home_lambda)
+sim_away_goals <- rpois(n_sims, lambda = missing_away_lambda)
+
+missing_home_win_prob  <- mean(sim_home_goals > sim_away_goals)
+missing_draw_prob      <- mean(sim_home_goals == sim_away_goals)
+missing_home_loss_prob <- mean(sim_home_goals < sim_away_goals)
+missing_away_win_prob  <- mean(sim_away_goals > sim_home_goals)
+missing_away_loss_prob <- mean(sim_away_goals < sim_home_goals)
+
+missing_home_xpoints <- 3 * missing_home_win_prob + 1 * missing_draw_prob
+missing_away_xpoints <- 3 * missing_away_win_prob + 1 * missing_draw_prob
+
+missing_match_rows <- tibble(
+  MATCH_WYID = c(missing_match_id, missing_match_id),
+  TEAM_WYID  = c(missing_home_team_id, missing_away_team_id),
+  OPPONENTTEAM_WYID = c(missing_away_team_id, missing_home_team_id),
+  MATCHLABEL = c(missing_match_label, missing_match_label),
+  DATE = c(missing_match_date, missing_match_date),
+  DATEUTC = c(missing_match_dateutc, missing_match_dateutc),
+  MATCHSTATUS = c("Played", "Played"),
+  COMPETITION_WYID = c(competition_id, competition_id),
+  SEASON_WYID = c(season_id, season_id),
+  ROUND_WYID = c(NA_integer_, NA_integer_),
+  GAMEWEEK = c(missing_gameweek, missing_gameweek),
+  team_name = c(missing_home_team_name, missing_away_team_name),
+  opponent_name = c(missing_away_team_name, missing_home_team_name),
+  goals_for = c(missing_home_goals, missing_away_goals),
+  raw_shots = c(NA_integer_, NA_integer_),
+  model_shots = c(NA_integer_, NA_integer_),
+  xg_for = c(missing_home_lambda, missing_away_lambda),
+  avg_xg_per_shot = c(NA_real_, NA_real_),
+  goals_against = c(missing_away_goals, missing_home_goals),
+  opp_raw_shots = c(NA_integer_, NA_integer_),
+  opp_model_shots = c(NA_integer_, NA_integer_),
+  xg_against = c(missing_away_lambda, missing_home_lambda),
+  opp_avg_xg_per_shot = c(NA_real_, NA_real_),
+  actual_points = c(3, 0),
+  xPoints = c(missing_home_xpoints, missing_away_xpoints),
+  win_prob = c(missing_home_win_prob, missing_away_win_prob),
+  draw_prob = c(missing_draw_prob, missing_draw_prob),
+  loss_prob = c(missing_home_loss_prob, missing_away_loss_prob)
+)
+
+## =========================================================
+## 12) Simulér alle kampe og beregn xPoints
+## =========================================================
+
+# Brug match_pairs fra tidligere i stedet for at bygge dem igen
+sim_match_pairs <- match_pairs %>%
+  mutate(
+    team_1 = map_int(team_ids, 1),
+    team_2 = map_int(team_ids, 2)
+  )
+
+simulation_results <- bind_rows(
+  lapply(seq_len(nrow(sim_match_pairs)), function(i) {
+    simulate_match_xpoints(
+      match_id = sim_match_pairs$MATCH_WYID[i],
+      team_1   = sim_match_pairs$team_1[i],
+      team_2   = sim_match_pairs$team_2[i],
+      shot_df  = season_model_data,
+      n_sims   = n_sims
+    )
+  })
+)
+
+match_team_stats <- match_team_stats %>%
+  select(-any_of(c("xPoints", "win_prob", "draw_prob", "loss_prob"))) %>%
+  left_join(simulation_results, by = c("MATCH_WYID", "TEAM_WYID")) %>%
+  mutate(
+    xPoints   = coalesce(xPoints, 0),
+    win_prob  = coalesce(win_prob, 0),
+    draw_prob = coalesce(draw_prob, 0),
+    loss_prob = coalesce(loss_prob, 0)
+  )
+
+# Tilføj den imputede kamp efter simulationen
+match_team_stats <- bind_rows(match_team_stats, missing_match_rows)
+
+## =========================================================
+## 13) Byg faktiske resultater og ligatabel
+## =========================================================
+
+actual_match_long <- build_actual_match_long(matches_tbl, competition_id, season_id)
+
+league_table <- match_team_stats %>%
+  select(MATCH_WYID, TEAM_WYID, team_name, xg_for, xg_against, xPoints) %>%
+  left_join(
+    actual_match_long %>%
+      select(MATCH_WYID, team_name, goals_for, goals_against, actual_points),
+    by = c("MATCH_WYID", "team_name")
+  ) %>%
+  mutate(
+    W  = as.integer(goals_for > goals_against),
+    D  = as.integer(goals_for == goals_against),
+    L  = as.integer(goals_for < goals_against),
+    GD = goals_for - goals_against
+  ) %>%
+  group_by(TEAM_WYID, team_name) %>%
+  summarise(
+    M   = n_distinct(MATCH_WYID),
+    W   = sum(W, na.rm = TRUE),
+    D   = sum(D, na.rm = TRUE),
+    L   = sum(L, na.rm = TRUE),
+    G   = sum(goals_for, na.rm = TRUE),
+    GA  = sum(goals_against, na.rm = TRUE),
+    GD  = sum(GD, na.rm = TRUE),
+    PTS = sum(actual_points, na.rm = TRUE),
+    xG  = sum(xg_for, na.rm = TRUE),
+    xGA = sum(xg_against, na.rm = TRUE),
+    xPTS = sum(xPoints, na.rm = TRUE),
+    PTS_minus_xPTS = PTS - xPTS,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(PTS), desc(GD), desc(G)) %>%
+  mutate(
+    Rank = row_number(),
+    xG   = round(xG, 2),
+    xGA  = round(xGA, 2),
+    xPTS = round(xPTS, 2),
+    PTS_minus_xPTS = round(PTS_minus_xPTS, 2)
+  ) %>%
+  select(Rank, team_name, M, W, D, L, G, GA, PTS, xG, xGA, xPTS, PTS_minus_xPTS)
+
+league_table
+
+## =========================================================
+## 14) Klargør data til analyse og grafer
+## =========================================================
+
+team_match_table <- match_team_stats %>%
+  select(
+    MATCH_WYID, DATE, GAMEWEEK, MATCHLABEL, TEAM_WYID, team_name,
+    OPPONENTTEAM_WYID, opponent_name, goals_for, goals_against,
+    actual_points, xg_for, xg_against, xPoints, win_prob, draw_prob, loss_prob
+  ) %>%
+  mutate(
+    xg_for = round(xg_for, 2),
+    xg_against = round(xg_against, 2),
+    xPoints = round(xPoints, 2),
+    win_prob = round(win_prob, 3),
+    draw_prob = round(draw_prob, 3),
+    loss_prob = round(loss_prob, 3)
+  ) %>%
+  arrange(DATE, MATCH_WYID)
+
+points_plot_data <- league_table %>%
+  select(team_name, PTS, xPTS) %>%
+  pivot_longer(cols = c(PTS, xPTS), names_to = "type", values_to = "value")
+
+scatter_data <- league_table %>%
+  mutate(
+    brondby_flag = ifelse(team_name == "Brøndby IF", "Brøndby IF", "Øvrige hold")
+  )
+
+brondby_summary <- league_table %>%
+  filter(team_name == "Brøndby IF")
+
+team_trend_data <- match_team_stats %>%
+  arrange(team_name, DATE) %>%
+  group_by(team_name) %>%
+  mutate(match_number = row_number()) %>%
+  ungroup()
+
+## =========================================================
+## 15) Shiny-app
+## =========================================================
+ui <- navbarPage(
+  title = "Superliga xPoints 2024/25",
+  theme = bs_theme(
+    version = 5,
+    bootswatch = "flatly",
+    primary = "#002B7F",
+    secondary = "#FFD200",
+    base_font = font_google("Inter")
+  ),
+  
+  # TAB 1
+  tabPanel(
+    "Ligaoversigt",
+    fluidPage(
+      br(),
+      fluidRow(
+        column(3, h5("Antal hold"), h2(nrow(league_table))),
+        column(3, h5("Antal kampe"), h2(length(unique(match_team_stats$MATCH_WYID)))),
+        column(3, h5("Brøndby actual points"), h2(ifelse(nrow(brondby_summary)==1, brondby_summary$PTS, NA))),
+        column(3, h5("Brøndby xPoints"), h2(ifelse(nrow(brondby_summary)==1, brondby_summary$xPTS, NA)))
+      ),
+      br(),
+      fluidRow(
+        column(12, DTOutput("league_table_dt"))
+      ),
+      br(),
+      fluidRow(
+        column(6, plotOutput("points_plot")),
+        column(6, plotOutput("scatter_plot"))
+      )
+    )
+  ),
+  
+  # TAB 2
+  tabPanel(
+    "Holdanalyse",
+    fluidPage(
+      sidebarLayout(
+        sidebarPanel(
+          selectInput("team_select", "Vælg hold",
+                      choices = sort(unique(team_match_table$team_name)),
+                      selected = "Brøndby IF")
+        ),
+        mainPanel(
+          DTOutput("team_matches_dt"),
+          plotOutput("team_xpoints_plot"),
+          plotOutput("team_xg_plot")
+        )
+      )
+    )
+  ),
+  
+  # TAB 3
+  tabPanel(
+    "xG udvikling",
+    fluidPage(
+      sidebarLayout(
+        sidebarPanel(
+          selectInput("team_select_2", "Vælg hold",
+                      choices = sort(unique(team_trend_data$team_name)),
+                      selected = "Brøndby IF")
+        ),
+        mainPanel(
+          plotOutput("xg_trend_plot"),
+          plotOutput("points_bar_plot")
+        )
+      )
+    )
+  ),
+  
+  # TAB 4 
+  tabPanel(
+    "Spilleranalyse (6.1)",
+    fluidPage(
+      br(),
+      fluidRow(
+        column(6,
+               h4("Top 10 målscorere"),
+               plotOutput("top_scorers_plot")
+        ),
+        column(6,
+               h4("Bethany Mead – nøgletal"),
+               tableOutput("bethany_table")
+        )
+      ),
+      br(),
+      fluidRow(
+        column(12,
+               h4("Skudposition og vinkel"),
+               plotOutput("bethany_pitch_plot")
+        )
+      )
+    )
+  )
+)
+server <- function(input, output, session) {
+  
+  output$league_table_dt <- renderDT({
+    datatable(
+      league_table,
+      rownames = FALSE,
+      options = list(pageLength = 12, dom = "tip", autoWidth = TRUE)
+    ) %>%
+      formatStyle(
+        "team_name",
+        target = "row",
+        backgroundColor = styleEqual("Brøndby IF", "#fff3cd"),
+        fontWeight = styleEqual("Brøndby IF", "bold")
+      ) %>%
+      formatStyle(
+        "PTS_minus_xPTS",
+        color = styleInterval(c(-0.001, 0.001), c("#c0392b", "#2c3e50", "#1e8449"))
+      )
+  })
+  
+  output$points_plot <- renderPlot({
+    ggplot(points_plot_data, aes(x = reorder(team_name, value), y = value, fill = type)) +
+      geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+      coord_flip() +
+      scale_fill_manual(values = c("PTS" = "#002B7F", "xPTS" = "#FFD200")) +
+      labs(x = NULL, y = "Point", fill = NULL) +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$scatter_plot <- renderPlot({
+    ggplot(scatter_data, aes(x = xG, y = xGA)) +
+      geom_point(aes(color = brondby_flag), size = 4, alpha = 0.85) +
+      geom_text(aes(label = team_name), hjust = -0.05, size = 4) +
+      scale_color_manual(values = c("Brøndby IF" = "#FFD200", "Øvrige hold" = "#002B7F")) +
+      labs(x = "Samlet xG", y = "Samlet xGA", color = NULL) +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = "bottom")
+  })
+  
+  team_filtered <- reactive({
+    team_match_table %>%
+      filter(team_name == input$team_select) %>%
+      arrange(DATE)
+  })
+  
+  output$team_matches_dt <- renderDT({
+    datatable(
+      team_filtered(),
+      rownames = FALSE,
+      options = list(pageLength = 10, autoWidth = TRUE)
+    )
+  })
+  
+  output$team_xpoints_plot <- renderPlot({
+    df <- team_filtered() %>%
+      mutate(match_order = row_number())
+    
+    ggplot(df, aes(x = match_order, y = xPoints)) +
+      geom_col(fill = "#002B7F", alpha = 0.9) +
+      geom_hline(yintercept = 1, linetype = "dashed", color = "grey50") +
+      labs(x = "Kampnummer", y = "xPoints") +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$team_xg_plot <- renderPlot({
+    df <- team_filtered() %>%
+      mutate(match_order = row_number()) %>%
+      select(match_order, xg_for, xg_against) %>%
+      pivot_longer(cols = c(xg_for, xg_against), names_to = "type", values_to = "value")
+    
+    ggplot(df, aes(x = match_order, y = value, color = type)) +
+      geom_line(linewidth = 1.2) +
+      geom_point(size = 2.5) +
+      scale_color_manual(
+        breaks = c("xg_for", "xg_against"),
+        values = c(
+          "xg_for" = "#002B7F",
+          "xg_against" = "#FFD200"
+        ),
+        labels = c(
+          "xg_for" = "xG for",
+          "xg_against" = "xGA"
+        )
+      ) +
+      labs(x = "Kampnummer", y = "xG", color = NULL) +
+      theme_minimal(base_size = 14)
+  })
+  
+  team_data_selected <- reactive({
+    team_trend_data %>%
+      filter(team_name == input$team_select_2) %>%
+      arrange(DATE)
+  })
+  
+  output$xg_trend_plot <- renderPlot({
+    df <- team_data_selected()
+    
+    df_long <- df %>%
+      select(match_number, xg_for, xg_against) %>%
+      pivot_longer(
+        cols = c(xg_for, xg_against),
+        names_to = "type",
+        values_to = "value"
+      )
+    
+    ggplot(df_long, aes(x = match_number, y = value, color = type)) +
+      geom_line(linewidth = 1.2) +
+      geom_point(size = 2.5) +
+      scale_color_manual(
+        breaks = c("xg_for", "xg_against"),
+        values = c(
+          "xg_for" = "#00BFC4",
+          "xg_against" = "#F8766D"
+        ),
+        labels = c(
+          "xg_for" = "xG for",
+          "xg_against" = "xGA"
+        )
+      ) +
+      labs(x = "Kampnummer", y = "xG", color = NULL) +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$points_bar_plot <- renderPlot({
+    df <- team_data_selected()
+    
+    summary_df <- df %>%
+      summarise(
+        actual_points = sum(actual_points, na.rm = TRUE),
+        expected_points = sum(xPoints, na.rm = TRUE)
+      ) %>%
+      mutate(difference = actual_points - expected_points) %>%
+      select(actual_points, expected_points, difference) %>%
+      pivot_longer(cols = everything(), names_to = "type", values_to = "value")
+    
+    ggplot(summary_df, aes(x = type, y = value, fill = type)) +
+      geom_col(width = 0.6) +
+      scale_fill_manual(
+        values = c(
+          "actual_points" = "#002B7F",
+          "expected_points" = "#FFD200",
+          "difference" = "#6c757d"
+        ),
+        labels = c("Actual points", "Expected points", "Difference")
+      ) +
+      labs(x = NULL, y = "Point", fill = NULL) +
+      theme_minimal(base_size = 14)
+  })
+  
+  output$top_scorers_plot <- renderPlot({
+    ggplot(goalrank, aes(x = reorder(player.name, goals), y = goals)) +
+      geom_col(fill = "#2E8B57") +
+      coord_flip() +
+      labs(x = "Spiller", y = "Mål") +
+      theme_minimal()
+  })
+  
+  output$bethany_table <- renderTable({
+    bethany_mean
+  })
+  
+  output$bethany_pitch_plot <- renderPlot({
+    ggplot() +
+      annotate_pitch(
+        dimensions = pitch_statsbomb,
+        colour = "white",
+        fill = "#2E8B57"
+      ) +
+      geom_polygon(
+        data = triangle_df,
+        aes(x = x, y = y),
+        fill = "#F4D35E",
+        alpha = 0.2
+      ) +
+      geom_point(
+        data = bethany_avg,
+        aes(x = avg_shx, y = avg_shy),
+        size = 4,
+        color = "white"
+      ) +
+      coord_flip(xlim = c(80, 121)) +
+      scale_y_reverse() +
+      theme_pitch()
+  })
+}
+
+shinyApp(ui, server)
+
+
+
+## opgave 6.1
+
+
+## 6.1
+
+# =========================
+# Pakker
+# =========================
+library(jsonlite)
+library(dplyr)
+library(ggplot2)
+library(ggsoccer)
+library(purrr)
+
+# =========================
+# 1) HENT DATA FRA GITHUB
+# =========================
+
+# funktion til at hente eventdata
+get_sb_data <- function(match_id) {
+  url <- paste0("https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/", match_id, ".json")
+  tryCatch(fromJSON(url, flatten = TRUE), error = function(e) NULL)
+}
+
+# hent alle kampe (kvinde EM 2022)
+matches <- fromJSON("https://raw.githubusercontent.com/statsbomb/open-data/master/data/matches/53/106.json", flatten = TRUE)
+
+match_ids <- matches$match_id
+
+# hent eventdata
+events_list <- map(match_ids, get_sb_data)
+events <- bind_rows(events_list)
+
+# =========================
+# 2) FILTRER SKUD
+# =========================
+shots <- events %>%
+  filter(type.name == "Shot")
+
+# =========================
+# 3) EKSTRAHER KOORDINATER
+# =========================
+
+shots <- shots %>%
+  mutate(
+    shx = map_dbl(location, 1),
+    shy = map_dbl(location, 2)
+  )
+
+# =========================
+# 4) TOP 10 MÅLSCORERE
+# =========================
+
+goalrank <- shots %>%
+  filter(shot.outcome.name == "Goal") %>%
+  group_by(player.name) %>%
+  summarise(goals = n()) %>%
+  arrange(desc(goals)) %>%
+  slice_head(n = 10)
+
+# plot
+ggplot(goalrank, aes(x = reorder(player.name, goals), y = goals)) +
+  geom_col(fill = "#2E8B57") +
+  coord_flip() +
+  labs(title = "Top 10 målscorere EM 2022 (kvinder)",
+       x = "Spiller",
+       y = "Antal mål")
+
+# =========================
+# 5) FEATURE ENGINEERING
+# =========================
+
+# afstand
+shots <- shots %>%
+  mutate(
+    distance = sqrt((120 - shx)^2 + (40 - shy)^2)
+  )
+
+# vinkel funktion
+angle_to_goal <- function(x, y) {
+  goal_left  <- c(120, 36)
+  goal_right <- c(120, 44)
+  
+  v1 <- c(goal_left[1] - x, goal_left[2] - y)
+  v2 <- c(goal_right[1] - x, goal_right[2] - y)
+  
+  dot <- sum(v1 * v2)
+  len1 <- sqrt(sum(v1^2))
+  len2 <- sqrt(sum(v2^2))
+  
+  angle <- acos(dot / (len1 * len2))
+  return(angle)
+}
+
+# beregn vinkel
+shots <- shots %>%
+  rowwise() %>%
+  mutate(angle = angle_to_goal(shx, shy)) %>%
+  ungroup()
+
+# konverter til grader + meter
+shots <- shots %>%
+  mutate(
+    angle_deg = angle * 180 / pi,
+    distance_m = distance * 0.87
+  )
+
+# =========================
+# 6) BETHANY MEAD ANALYSE
+# =========================
+
+bethany_mean <- shots %>%
+  filter(player.name == "Bethany Mead") %>%
+  summarise(
+    avg_angle = mean(angle_deg, na.rm = TRUE),
+    avg_distance = mean(distance_m, na.rm = TRUE)
+  )
+
+bethany_mean
+
+# =========================
+# 7) PITCH PLOT
+# =========================
+
+bethany_avg <- shots %>%
+  filter(player.name == "Bethany Mead") %>%
+  summarise(
+    avg_shx = mean(shx, na.rm = TRUE),
+    avg_shy = mean(shy, na.rm = TRUE)
+  )
+
+triangle_df <- data.frame(
+  x = c(bethany_avg$avg_shx, 120, 120),
+  y = c(bethany_avg$avg_shy, 36, 44)
+)
+
+ggplot() +
+  annotate_pitch(
+    dimensions = pitch_statsbomb,
+    colour = "white",
+    fill = "#2E8B57"
+  ) +
+  geom_polygon(
+    data = triangle_df,
+    aes(x = x, y = y),
+    fill = "#F4D35E",
+    alpha = 0.2
+  ) +
+  geom_point(
+    data = bethany_avg,
+    aes(x = avg_shx, y = avg_shy),
+    size = 4,
+    color = "white"
+  ) +
+  coord_flip(xlim = c(80, 121)) +
+  scale_y_reverse() +
+  theme_pitch() +
+  labs(title = "Bethany Mead – gennemsnitlig skudposition")
+
 

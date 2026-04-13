@@ -1,0 +1,317 @@
+# ============================================================
+# PAKKER
+# ============================================================
+
+library(tidyverse)
+library(jsonlite)
+library(ggplot2)
+library(ggsoccer)
+
+theme_set(theme_minimal())
+
+# ============================================================
+# HENT DATA
+# ============================================================
+
+competitions <- fromJSON("https://raw.githubusercontent.com/statsbomb/open-data/master/data/competitions.json")
+
+comp_w <- competitions %>%
+  filter(competition_name == "Women's World Cup") %>%
+  slice(1)
+
+comp_m <- competitions %>%
+  filter(competition_name == "FIFA World Cup") %>%
+  slice(1)
+
+get_matches <- function(comp_id, season_id){
+  url <- paste0("https://raw.githubusercontent.com/statsbomb/open-data/master/data/matches/", comp_id, "/", season_id, ".json")
+  fromJSON(url, flatten = TRUE)
+}
+
+matches_w <- get_matches(comp_w$competition_id, comp_w$season_id)
+matches_m <- get_matches(comp_m$competition_id, comp_m$season_id)
+
+set.seed(123)
+n <- 20
+
+# Vi sampler 20 tilfældige kampe fra kvinder og mænd
+# Formål: gøre datasættet håndterbart og sammenligneligt
+f_ids <- sample(matches_w$match_id, n)
+m_ids <- sample(matches_m$match_id, n)
+
+
+# Funktion der henter eventdata fra StatsBomb GitHub
+get_events <- function(match_id) {
+  
+  # Vi bygger URL til JSON-fil med events for én kamp
+  url <- paste0(
+    "https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/", 
+    match_id, 
+    ".json"
+  )
+  
+  # Vi prøver at hente data (tryCatch for at undgå crash hvis fil fejler)
+  df <- tryCatch(
+    fromJSON(url, flatten = TRUE),
+    error = function(e) NULL
+  )
+  
+  # Hvis data ikke findes → returnér NULL
+  if(is.null(df)) return(NULL)
+  
+  # Vi tilføjer match_id som kolonne (så vi kan identificere kampen senere)
+  df$match_id <- match_id
+  
+  # Returnér som dataframe
+  as.data.frame(df)
+}
+
+# Vi henter eventdata for alle kvindekampe
+f_events <- lapply(f_ids, get_events) %>% 
+  bind_rows() %>% 
+  mutate(gender = "Kvinder")
+
+# Samme for mænd
+m_events <- lapply(m_ids, get_events) %>% 
+  bind_rows() %>% 
+  mutate(gender = "Mænd")
+
+# Vi samler det hele i ét datasæt
+events <- bind_rows(f_events, m_events)
+
+# ============================================================
+# KLARGØR DATA
+# ============================================================
+
+shots <- events %>%
+  
+  # Vi filtrerer kun skud → fordi det er fokus i analysen
+  filter(type.name == "Shot", !is.na(location)) %>%
+  
+  rowwise() %>%
+  
+  mutate(
+    # x- og y-position på banen
+    x = location[[1]],
+    y = location[[2]],
+    
+    # Afstand til mål (geometri)
+    dist = sqrt((120 - x)^2 + (40 - y)^2),
+    
+    # xG (sandsynlighed for mål)
+    # hvis NA → sæt til 0 (så modellen ikke fejler)
+    xg = ifelse(is.na(shot.statsbomb_xg), 0, shot.statsbomb_xg)
+  ) %>%
+  
+  ungroup()
+
+# ============================================================
+# TREKANT FUNKTION
+# ============================================================
+
+in_triangle <- function(px, py, sx, sy){
+  
+  # Funktion til at beregne arealet af en trekant
+  area <- function(x1,y1,x2,y2,x3,y3){
+    abs((x1*(y2-y3) + x2*(y3-y1) + x3*(y1-y2)) / 2)
+  }
+  
+  # A = arealet af hele trekanten (skud → mål)
+  A  <- area(sx, sy, 120, 36, 120, 44)
+  
+  # A1, A2, A3 = mindre trekanter med punktet (spiller)
+  A1 <- area(px, py, 120, 36, 120, 44)
+  A2 <- area(sx, sy, px, py, 120, 44)
+  A3 <- area(sx, sy, 120, 36, px, py)
+  
+  # Hvis summen er lig → punktet er inde i trekanten
+  abs(A - (A1 + A2 + A3)) < 1
+}
+
+# ============================================================
+# EGO MODEL (FORBEDRET)
+# ============================================================
+
+shots <- shots %>%
+  rowwise() %>%
+  mutate(
+    
+    best_diff = {
+      
+      # Freeze-frame = alle spillere i situationen
+      ff <- shot.freeze_frame
+      
+      # Hvis ingen data → NA
+      if(is.null(ff) || !is.data.frame(ff)) NA else {
+        
+        # Opdel i medspillere og modspillere
+        tms  <- ff[ff$teammate == TRUE, ]
+        opps <- ff[ff$teammate == FALSE, ]
+        
+        # Hvis ingen → NA
+        if(nrow(tms) == 0 || nrow(opps) == 0) NA else {
+          
+          # Skyttens position
+          sx <- x
+          sy <- y
+          
+          # Tæl hvor mange modstandere der blokerer skuddet
+          shooter_block <- sum(sapply(1:nrow(opps), function(k){
+            loc <- opps$location[[k]]
+            if(length(loc) < 2) return(FALSE)
+            in_triangle(loc[1], loc[2], sx, sy)
+          }))
+          
+          # Score for skytten (lav = god position)
+          shooter_score <- 
+            shooter_block * 10 +   # pres (vigtigste faktor)
+            abs(40 - sy) * 0.3 +  # vinkel
+            dist * 0.2            # afstand
+          
+          # Sammenlign med alle medspillere
+          diffs <- sapply(1:nrow(tms), function(j){
+            
+            loc <- tms$location[[j]]
+            if(length(loc) < 2) return(NA)
+            
+            tx <- loc[1]
+            ty <- loc[2]
+            
+            # pres på medspiller
+            tm_block <- sum(sapply(1:nrow(opps), function(k){
+              loc2 <- opps$location[[k]]
+              if(length(loc2) < 2) return(FALSE)
+              in_triangle(loc2[1], loc2[2], tx, ty)
+            }))
+            
+            # score for medspiller
+            tm_score <- 
+              tm_block * 10 +
+              abs(40 - ty) * 0.3 +
+              sqrt((120 - tx)^2 + (40 - ty)^2) * 0.2
+            
+            # forskel → hvor meget bedre medspilleren er
+            shooter_score - tm_score
+          })
+          
+          # vælg bedste medspiller
+          max(diffs, na.rm = TRUE)
+        }
+      }
+    },
+    
+    # Hvis forskellen er stor → ego skud
+    ego = ifelse(!is.na(best_diff) & best_diff > 3, TRUE, FALSE)
+    
+  ) %>%
+  ungroup()
+# ============================================================
+# VISUALS (PROFESSIONELLE)
+# ============================================================
+
+# 1 DISTANCE
+ggplot(shots, aes(x = gender, y = dist, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(
+    title = "Kvinder afslutter tættere på mål",
+    subtitle = "Indikerer bedre beslutningstagning",
+    y = "Afstand til mål", x = ""
+  ) +
+  theme(legend.position = "none")
+
+# 2 xG
+ggplot(shots, aes(x = dist, y = xg, color = gender)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(se = FALSE) +
+  labs(
+    title = "Mænd skyder oftere fra lavere kvalitet positioner",
+    x = "Afstand", y = "xG"
+  )
+
+# 3 SHOTS PER GAME
+shots_per_game <- shots %>%
+  group_by(gender, match_id) %>%
+  summarise(n = n(), .groups="drop") %>%
+  group_by(gender) %>%
+  summarise(avg = mean(n))
+
+ggplot(shots_per_game, aes(x = gender, y = avg, fill = gender)) +
+  geom_col(width = 0.6) +
+  labs(
+    title = "Kvinder har flere skud pr kamp",
+    y = "Gennemsnitlige skud", x = ""
+  ) +
+  theme(legend.position = "none")
+
+# 4 EGO
+ego_summary <- shots %>%
+  group_by(gender) %>%
+  summarise(ego_rate = mean(ego, na.rm=TRUE) * 100)
+
+ggplot(ego_summary, aes(x = gender, y = ego_rate, fill = gender)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = round(ego_rate,1)), vjust = -0.5) +
+  labs(
+    title = "Mænd tager flere ego-skud",
+    subtitle = "Ignorerer bedre placerede medspillere",
+    y = "% ego skud", x = ""
+  ) +
+  theme(legend.position = "none")
+
+# ============================================================
+# CASE VISUAL (EGO)
+# ============================================================
+
+plot_case <- function(shot_row){
+  
+  ff <- shot_row$shot.freeze_frame[[1]]
+  sx <- shot_row$x
+  sy <- shot_row$y
+  
+  df <- data.frame(
+    px = sapply(ff$location, function(l) l[1]),
+    py = sapply(ff$location, function(l) l[2]),
+    teammate = ff$teammate
+  )
+  
+  df$col <- ifelse(df$teammate, "Medspiller", "Modstander")
+  
+  tri <- data.frame(
+    x = c(sx, 120, 120),
+    y = c(sy, 36, 44)
+  )
+  
+  ggplot() +
+    annotate_pitch(dimensions = pitch_statsbomb, fill = "#2e7d32") +
+    
+    geom_polygon(data = tri, aes(x = x, y = y),
+                 fill = "yellow", alpha = 0.3) +
+    
+    geom_point(data = df, aes(x = px, y = py, color = col),
+               size = 4) +
+    
+    geom_point(aes(x = sx, y = sy),
+               color = "gold", size = 6) +
+    
+    scale_color_manual(values = c(
+      "Medspiller" = "#1976d2",
+      "Modstander" = "black"
+    )) +
+    
+    coord_flip(xlim = c(49,121)) +
+    scale_y_reverse() +
+    
+    theme_pitch() +
+    
+    labs(
+      title = "Beslutningssituation (trekant + pres)"
+    )
+}
+
+# CASES
+case_ego <- shots %>% filter(ego == TRUE) %>% slice(1)
+case_good <- shots %>% filter(ego == FALSE) %>% slice(1)
+
+plot_case(case_ego)
+plot_case(case_good)
+
